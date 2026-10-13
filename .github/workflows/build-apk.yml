@@ -38,7 +38,7 @@ jobs:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-v2-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v3-${{ hashFiles('buildozer.spec') }}
 
       - name: Build APK
         shell: bash
