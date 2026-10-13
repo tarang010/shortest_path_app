@@ -44,6 +44,20 @@ jobs:
         shell: bash
         run: buildozer android debug 2>&1 | tee build.log
 
+      - name: Show the real error
+        if: failure()
+        shell: bash
+        run: |
+          echo "=============== ERROR SUMMARY (paste this) ==============="
+          n=$(grep -n "# Command failed" build.log | head -1 | cut -d: -f1)
+          if [ -n "$n" ]; then
+            start=$(( n > 70 ? n - 70 : 1 ))
+            sed -n "${start},$((n+2))p" build.log | cut -c1-300
+          else
+            tail -n 80 build.log | cut -c1-300
+          fi
+          echo "=============== END ERROR SUMMARY ==============="
+
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
