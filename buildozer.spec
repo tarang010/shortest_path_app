@@ -5,7 +5,7 @@ package.domain = org.example
 source.dir = .
 source.include_exts = py,png,jpg,kv
 version = 1.0
-requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.0,requests,urllib3,idna,charset-normalizer,certifi
+requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.0,kivy_garden.mapview,requests,urllib3,idna,charset-normalizer,certifi
 orientation = portrait
 fullscreen = 0
 android.permissions = INTERNET
