@@ -19,13 +19,18 @@ from kivy.properties import BooleanProperty, ListProperty, NumericProperty, Stri
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
+from kivy.uix.dropdown import DropDown
 from kivy.uix.spinner import SpinnerOption  # noqa: F401  (styled in KV)
+from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 from kivy_garden.mapview import MapLayer, MapView
 
 import algos
 import geo
+import places
+import traffic
 from modes import MODES, MODE_NAMES
+from tracker import Tracker
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -39,6 +44,36 @@ KV = """
 #:set FIELD (0.094, 0.231, 0.463, 1)
 #:set ACCENT (0.133, 0.827, 0.929, 1)
 #:set MUTED (0.66, 0.77, 0.93, 1)
+#:set TRAFFIC_LIGHT (0.133, 0.8, 0.133, 1)
+#:set TRAFFIC_MODERATE (1.0, 0.647, 0.0, 1) 
+#:set TRAFFIC_HEAVY (0.863, 0.196, 0.184, 1)
+
+<AutoCompleteInput>:
+    background_normal: ''
+    background_active: ''
+    background_color: FIELD
+    foreground_color: 1, 1, 1, 1
+    hint_text_color: MUTED
+    cursor_color: ACCENT
+    selection_color: 0.13, 0.83, 0.93, 0.35
+    padding: [dp(14), dp(13), dp(14), dp(10)]
+    multiline: False
+    write_tab: False
+    size_hint_y: None
+    height: dp(46)
+    font_size: '15sp'
+
+<SuggestionItem>:
+    size_hint_y: None
+    height: dp(40)
+    background_normal: ''
+    background_down: ''
+    background_color: FIELD if self.state == 'normal' else ACCENT
+    color: (1, 1, 1, 1) if self.state == 'normal' else (0.039, 0.122, 0.267, 1)
+    halign: 'left'
+    text_size: self.width - dp(20), None
+    font_size: '13sp'
+    padding: [dp(10), 0]
 
 <NavInput@TextInput>:
     background_normal: ''
@@ -163,6 +198,67 @@ KV = """
             valign: 'top'
             text_size: self.size
 
+<TrafficSettings>:
+    orientation: 'horizontal'
+    size_hint_y: None
+    height: dp(46)
+    spacing: dp(8)
+    padding: dp(10), dp(4)
+    canvas.before:
+        Color:
+            rgba: PANEL
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(8)]
+    Label:
+        text: 'Traffic:'
+        color: MUTED
+        font_size: '13sp'
+        size_hint_x: None
+        width: dp(50)
+        halign: 'left'
+        text_size: self.size
+    NavInput:
+        id: traffic_key
+        hint_text: 'TomTom API Key (optional)'
+        size_hint_x: 0.7
+        height: dp(38)
+        font_size: '13sp'
+    NavButton:
+        text: 'ON' if root.traffic_enabled else 'OFF'
+        size_hint_x: 0.3
+        height: dp(38)
+        bg: ACCENT if root.traffic_enabled else PANEL
+        on_release: root.toggle_traffic()
+
+<TrackingControls>:
+    orientation: 'horizontal'
+    size_hint_y: None
+    height: dp(46)
+    spacing: dp(8)
+    padding: dp(10), dp(4)
+    canvas.before:
+        Color:
+            rgba: PANEL
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(8)]
+    Label:
+        text: root.tracking_status
+        color: ACCENT if root.is_tracking else MUTED
+        font_size: '13sp'
+        size_hint_x: 0.6
+        halign: 'left'
+        text_size: self.size
+    NavButton:
+        text: 'STOP' if root.is_tracking else 'START GPS'
+        size_hint_x: 0.4
+        height: dp(38)
+        bg: (0.863, 0.196, 0.184, 1) if root.is_tracking else ACCENT
+        on_release: root.toggle_tracking()
+
 <Form>:
     orientation: 'vertical'
     size_hint_y: None
@@ -175,13 +271,13 @@ KV = """
         Rectangle:
             pos: self.pos
             size: self.size
-    NavInput:
+    AutoCompleteInput:
         id: a
         hint_text: 'From  (e.g. Bengaluru)'
-    NavInput:
+    AutoCompleteInput:
         id: b
         hint_text: 'To  (e.g. New Delhi)'
-    NavInput:
+    AutoCompleteInput:
         id: stops
         hint_text: 'Extra stops (optional), separated by ;'
     BoxLayout:
@@ -197,6 +293,10 @@ KV = """
             text: 'Find routes'
             size_hint_x: 0.45
             on_release: root.go()
+    TrafficSettings:
+        id: traffic_settings
+    TrackingControls:
+        id: tracking_controls
 
 <Results>:
     orientation: 'vertical'
@@ -233,6 +333,12 @@ KV = """
             text: 'Shortest'
             bg: PANEL
             on_release: app.root.select_kind('short')
+        NavButton:
+            id: btraffic
+            text: 'Live Traffic'
+            bg: PANEL
+            opacity: 1 if app.root.has_traffic_data else 0.5
+            on_release: app.root.refresh_traffic() if app.root.has_traffic_data else None
     ScrollView:
         bar_color: ACCENT
         bar_width: dp(3)
@@ -247,7 +353,7 @@ KV = """
 <RouteCard>:
     orientation: 'vertical'
     size_hint_y: None
-    height: dp(62)
+    height: dp(84) if root.has_traffic else dp(62)
     padding: dp(14), dp(6)
     canvas.before:
         Color:
@@ -280,11 +386,108 @@ KV = """
         text_size: self.size
         shorten: True
         shorten_from: 'right'
+    Label:
+        text: root.traffic_info
+        font_size: '11sp'
+        color: root.traffic_color
+        halign: 'left'
+        valign: 'top'
+        text_size: self.size
+        opacity: 1 if root.has_traffic else 0
+        size_hint_y: None
+        height: dp(16) if root.has_traffic else 0
+        markup: True
 """
 
 
 class NavButton(Button):
     bg = ListProperty([0.133, 0.827, 0.929, 1])
+
+
+class AutoCompleteInput(TextInput):
+    """Enhanced input with place suggestions"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.dropdown = None
+        self.suggestions = []
+        self.bind(text=self.on_text_change)
+        self.bind(focus=self.on_focus_change)
+        
+    def on_text_change(self, instance, text):
+        if not text or len(text) < 3:
+            if self.dropdown:
+                self.dropdown.dismiss()
+            return
+        
+        # Get suggestions in background thread
+        threading.Thread(target=self._fetch_suggestions, args=(text,), daemon=True).start()
+    
+    def _fetch_suggestions(self, text):
+        try:
+            # Get current map center as bias
+            app = App.get_running_app()
+            center = None
+            if hasattr(app.root, 'map') and app.root.map:
+                center = (app.root.map.lat, app.root.map.lon)
+            
+            suggestions = places.suggest(text, bias=center, limit=5)
+            Clock.schedule_once(lambda dt: self._show_suggestions(suggestions))
+        except Exception as e:
+            print(f"Places search error: {e}")
+    
+    def _show_suggestions(self, suggestions):
+        if not self.focus:  # Don't show if input lost focus
+            return
+            
+        if self.dropdown:
+            self.dropdown.dismiss()
+        
+        if not suggestions:
+            return
+            
+        self.dropdown = DropDown()
+        for sug in suggestions:
+            btn = SuggestionItem(text=sug['label'])
+            btn.suggestion_data = sug
+            btn.bind(on_release=lambda x: self._select_suggestion(x.suggestion_data))
+            self.dropdown.add_widget(btn)
+        
+        self.dropdown.open(self)
+    
+    def _select_suggestion(self, suggestion):
+        self.text = suggestion['label']
+        self.suggestion_coords = (suggestion['lat'], suggestion['lon'])
+        if self.dropdown:
+            self.dropdown.dismiss()
+    
+    def on_focus_change(self, instance, focus):
+        if not focus and self.dropdown:
+            Clock.schedule_once(lambda dt: self.dropdown.dismiss(), 0.1)
+
+
+class SuggestionItem(Button):
+    pass
+
+
+class TrafficSettings(BoxLayout):
+    traffic_enabled = BooleanProperty(False)
+    
+    def toggle_traffic(self):
+        self.traffic_enabled = not self.traffic_enabled
+        app = App.get_running_app()
+        app.root.traffic_enabled = self.traffic_enabled
+
+
+class TrackingControls(BoxLayout):
+    is_tracking = BooleanProperty(False)
+    tracking_status = StringProperty("GPS Tracking Off")
+    
+    def toggle_tracking(self):
+        app = App.get_running_app()
+        if self.is_tracking:
+            app.root.stop_tracking()
+        else:
+            app.root.start_tracking()
 
 
 class Loader(Widget):
@@ -324,18 +527,25 @@ class RouteCard(ButtonBehavior, BoxLayout):
     selected = BooleanProperty(False)
     title = StringProperty("")
     sub = StringProperty("")
+    has_traffic = BooleanProperty(False)
+    traffic_info = StringProperty("")
+    traffic_color = ListProperty([0.66, 0.77, 0.93, 1])  # MUTED
 
 
 class RouteLayer(MapLayer):
-    """All candidate routes (thin) + the selected one (thick blue) + A/B/stop markers.
+    """All candidate routes (thin) + the selected one (thick blue) + A/B/stop markers + user location.
     Uses pre-simplified zoom levels and viewport culling so 2,000 km routes stay smooth."""
 
     def __init__(self, **kw):
         super().__init__(**kw)
         self.routes, self.markers = [], []
+        self.user_location = None
+        self.user_path = []
 
-    def set_data(self, routes, markers):
+    def set_data(self, routes, markers, user_location=None, user_path=None):
         self.routes, self.markers = routes, markers
+        self.user_location = user_location
+        self.user_path = user_path or []
         self.reposition()
 
     @staticmethod
@@ -375,6 +585,7 @@ class RouteLayer(MapLayer):
         except Exception:
             bb = None
         with self.canvas:
+            # Draw routes
             for r in sorted(self.routes, key=lambda r: r.get("selected", False)):
                 coords = self._lod(r, z)
                 runs = self._runs(coords, bb) if (bb and len(coords) > 1200) else [coords]
@@ -398,6 +609,18 @@ class RouteLayer(MapLayer):
                         else:
                             Color(*ALT_COLOR)
                             Line(points=pc, width=dp(2.4), joint="round", cap="round")
+            
+            # Draw user path (breadcrumb trail)
+            if len(self.user_path) > 1:
+                path_pts = []
+                for la, lo in self.user_path:
+                    x, y = mv.get_window_xy_from(la, lo, z)
+                    path_pts += [x, y]
+                if len(path_pts) >= 4:
+                    Color(0.2, 0.8, 0.2, 0.7)  # Green path
+                    Line(points=path_pts, width=dp(3), joint="round", cap="round")
+            
+            # Draw route markers
             rad = dp(11)
             for la, lo, label, rgb in self.markers:
                 x, y = mv.get_window_xy_from(la, lo, z)
@@ -410,6 +633,16 @@ class RouteLayer(MapLayer):
                 tex = cl.texture
                 Color(1, 1, 1, 1)
                 Rectangle(texture=tex, pos=(x - tex.width / 2, y - tex.height / 2), size=tex.size)
+            
+            # Draw user location (blue dot)
+            if self.user_location:
+                la, lo = self.user_location
+                x, y = mv.get_window_xy_from(la, lo, z)
+                user_rad = dp(8)
+                Color(1, 1, 1, 1)  # White border
+                Ellipse(pos=(x - user_rad - 2, y - user_rad - 2), size=(2 * user_rad + 4, 2 * user_rad + 4))
+                Color(0.133, 0.827, 0.929, 1)  # Blue center
+                Ellipse(pos=(x - user_rad, y - user_rad), size=(2 * user_rad, 2 * user_rad))
 
 
 def dash_pieces(pts, dash, gap):
@@ -489,11 +722,30 @@ def solve(a_txt, b_txt, stops_txt, mode, push):
     spec = MODES[mode]
     labels = [a_txt] + [x for x in stops_txt.replace("\n", ";").split(";") if x.strip()] + [b_txt]
     names, pts = [], []
+    
+    # Enhanced place resolution with autocomplete data
     for k, t in enumerate(labels):
         push(f"Finding places... ({k+1}/{len(labels)})", [], _mark(pts) if pts else [], "")
-        la, lo, _ = geo.geocode(t.strip())          # sequential: Nominatim allows 1 request/second
-        names.append(t.strip())
-        pts.append((la, lo))
+        
+        # Check if we have coordinates from autocomplete
+        app = App.get_running_app()
+        form_inputs = [app.root.form.ids.a, app.root.form.ids.b, app.root.form.ids.stops]
+        coords_from_autocomplete = None
+        
+        if k == 0 and hasattr(form_inputs[0], 'suggestion_coords'):
+            coords_from_autocomplete = form_inputs[0].suggestion_coords
+        elif k == len(labels) - 1 and hasattr(form_inputs[1], 'suggestion_coords'):
+            coords_from_autocomplete = form_inputs[1].suggestion_coords
+        
+        if coords_from_autocomplete:
+            la, lo = coords_from_autocomplete
+            names.append(t.strip())
+            pts.append((la, lo))
+        else:
+            la, lo, _ = geo.geocode(t.strip())  # Fallback to regular geocoding
+            names.append(t.strip())
+            pts.append((la, lo))
+    
     n = len(pts)
     markers = _mark(pts)
     notes = spec["note"]
@@ -556,6 +808,8 @@ def solve(a_txt, b_txt, stops_txt, mode, push):
 # ----------------------------------------------------------------------------- UI root
 class Root(BoxLayout):
     busy = False
+    traffic_enabled = BooleanProperty(False)
+    has_traffic_data = BooleanProperty(False)
 
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -566,9 +820,158 @@ class Root(BoxLayout):
         self.left = BoxLayout(orientation="vertical")
         self.routes, self.fast_i, self.short_i, self.sel = [], -1, -1, -1
         self._orient = None
+        
+        # Initialize tracking
+        self.tracker = Tracker()
+        self.tracking_active = False
+        self.tracking_event = None
+        
+        # Traffic data
+        self.traffic_key = ""
+        
         Clock.schedule_once(lambda dt: self.map.add_layer(self.layer), 0)
         self.bind(size=lambda *a: self.relayout())
         self.relayout()
+
+    # --- GPS Tracking
+    def start_tracking(self):
+        """Start GPS location tracking"""
+        try:
+            from plyer import gps
+            gps.configure(on_location=self._on_location, on_status=self._on_gps_status)
+            gps.start(minTime=1000, minDistance=1)  # Update every second or 1 meter
+            self.tracking_active = True
+            self.tracker = Tracker()  # Reset tracker
+            
+            # Update tracking controls
+            controls = self.form.ids.tracking_controls
+            controls.is_tracking = True
+            controls.tracking_status = "GPS: Searching for signal..."
+            
+        except ImportError:
+            # Fallback for desktop testing - simulate GPS
+            self._simulate_gps()
+    
+    def stop_tracking(self):
+        """Stop GPS location tracking"""
+        self.tracking_active = False
+        if self.tracking_event:
+            self.tracking_event.cancel()
+            
+        try:
+            from plyer import gps
+            gps.stop()
+        except ImportError:
+            pass
+        
+        # Update tracking controls
+        controls = self.form.ids.tracking_controls  
+        controls.is_tracking = False
+        controls.tracking_status = "GPS Tracking Off"
+    
+    def _on_location(self, **kwargs):
+        """Handle GPS location update"""
+        if not self.tracking_active:
+            return
+            
+        lat = kwargs.get('lat', 0)
+        lon = kwargs.get('lon', 0)
+        acc = kwargs.get('accuracy', None)
+        
+        now = time.time()
+        if self.tracker.add_fix(lat, lon, now, acc):
+            # Update map center to current location
+            self.map.center_on(lat, lon)
+            
+            # Update status
+            controls = self.form.ids.tracking_controls
+            speed = self.tracker.speed * 3.6  # m/s to km/h
+            controls.tracking_status = f"GPS: {speed:.1f} km/h, {fmt_km(self.tracker.dist)} traveled"
+            
+            # Update route progress if we have a selected route
+            if self.sel >= 0 and self.sel < len(self.routes):
+                route = self.routes[self.sel]
+                if "coords" in route:
+                    from tracker import locate, cumulative
+                    cum = cumulative(route["coords"])
+                    covered, remaining, off = locate(route["coords"], cum, (lat, lon))
+                    
+                    if off < 100:  # Within 100m of route
+                        progress = f"Route: {fmt_km(covered)} done, {fmt_km(remaining)} left"
+                        controls.tracking_status = f"{progress} | {speed:.1f} km/h"
+    
+    def _on_gps_status(self, stype, status):
+        """Handle GPS status changes"""
+        controls = self.form.ids.tracking_controls
+        if status == 'provider-enabled':
+            controls.tracking_status = "GPS: Signal acquired"
+        elif status == 'provider-disabled':
+            controls.tracking_status = "GPS: Signal lost"
+    
+    def _simulate_gps(self):
+        """Simulate GPS for desktop testing"""
+        if not self.tracking_active:
+            return
+            
+        # Simulate movement around current map center
+        lat, lon = self.map.lat, self.map.lon
+        lat += (time.time() % 100) * 0.0001  # Move slightly
+        
+        now = time.time()
+        self.tracker.add_fix(lat, lon, now, 5.0)  # 5m accuracy
+        
+        controls = self.form.ids.tracking_controls
+        speed = self.tracker.speed * 3.6
+        controls.tracking_status = f"GPS: {speed:.1f} km/h (simulated)"
+        
+        # Schedule next update
+        self.tracking_event = Clock.schedule_once(lambda dt: self._simulate_gps(), 2)
+    
+    # --- Traffic Integration
+    def apply_traffic_to_routes(self):
+        """Apply traffic data to current routes"""
+        if not self.routes or not self.traffic_enabled:
+            return
+            
+        # Get traffic API key
+        traffic_key = self.form.ids.traffic_settings.ids.traffic_key.text.strip()
+        if not traffic_key:
+            self.results.ids.status.text = "Enter TomTom API key for traffic data"
+            return
+        
+        # Use current location as reference, or first route point
+        ref = (self.map.lat, self.map.lon)
+        if self.tracker.path:
+            ref = self.tracker.path[-1]
+        elif self.routes:
+            ref = self.routes[0]["coords"][0]
+        
+        def apply_traffic():
+            try:
+                used = traffic.apply_traffic(self.routes, ref, traffic_key)
+                Clock.schedule_once(lambda dt: self._traffic_applied(used))
+            except traffic.TrafficError as e:
+                Clock.schedule_once(lambda dt: self._traffic_error(str(e)))
+            except Exception as e:
+                Clock.schedule_once(lambda dt: self._traffic_error(f"Traffic error: {e}"))
+        
+        self.results.ids.status.text = "Getting live traffic data..."
+        threading.Thread(target=apply_traffic, daemon=True).start()
+    
+    def _traffic_applied(self, requests_used):
+        self.has_traffic_data = True
+        self.results.ids.status.text = f"Traffic updated ({requests_used} requests used)"
+        self._tag()  # Recalculate fastest/shortest with traffic
+        self._rebuild_cards("")
+        self._apply_selection(fit=False)
+    
+    def _traffic_error(self, error_msg):
+        self.results.ids.status.text = f"Traffic error: {error_msg}"
+    
+    def refresh_traffic(self):
+        """Refresh traffic data for current routes"""
+        if self.has_traffic_data:
+            self.apply_traffic_to_routes()
 
     # --- responsive layout: portrait = stacked, landscape = side-by-side
     def relayout(self):
@@ -633,6 +1036,11 @@ class Root(BoxLayout):
             self.routes = routes
             self._tag()
             self.sel = self.fast_i if routes else -1
+            
+            # Apply traffic if enabled and we have routes
+            if routes and self.traffic_enabled:
+                self.apply_traffic_to_routes()
+        
         self._rebuild_cards(notes)
         self._apply_selection(fit=True, markers=markers)
 
@@ -657,12 +1065,46 @@ class Root(BoxLayout):
             title = " + ".join(tags) if tags else "Alternative"
             if multi:
                 title += f"  [size=12sp][color=a8c4ee]{r['label']}[/color][/size]"
+            
+            # Main route info
             sub = f"{fmt_time(r['dur'])}   |   {fmt_km(r['dist'])}"
             if r.get("est"):
                 sub += "   |   estimate"
             if multi:
                 sub += "   |   " + " > ".join(map(str, r["order"]))
-            c = RouteCard(title=title, sub=sub, selected=(i == self.sel))
+            
+            # Traffic info
+            traffic_info = ""
+            traffic_color = [0.66, 0.77, 0.93, 1]  # MUTED
+            has_traffic = "traffic" in r and r["traffic"]["level"] is not None
+            
+            if has_traffic:
+                t = r["traffic"]
+                level = t["level"]
+                delay_min = t["delay"] / 60
+                
+                if level == "Light":
+                    traffic_color = [0.133, 0.8, 0.133, 1]  # Green
+                    traffic_info = f"🟢 {level} traffic (+{delay_min:.0f} min)"
+                elif level == "Moderate":
+                    traffic_color = [1.0, 0.647, 0.0, 1]  # Orange  
+                    traffic_info = f"🟡 {level} traffic (+{delay_min:.0f} min)"
+                else:  # Heavy
+                    traffic_color = [0.863, 0.196, 0.184, 1]  # Red
+                    traffic_info = f"🔴 {level} traffic (+{delay_min:.0f} min)"
+                
+                if t["closed"]:
+                    traffic_info += " [ROAD CLOSED]"
+                    traffic_color = [0.863, 0.196, 0.184, 1]
+            
+            c = RouteCard(
+                title=title, 
+                sub=sub, 
+                selected=(i == self.sel),
+                has_traffic=has_traffic,
+                traffic_info=traffic_info,
+                traffic_color=traffic_color
+            )
             c.idx = i
             c.bind(on_release=lambda w: self.select(w.idx))
             c.opacity = 0
@@ -698,7 +1140,15 @@ class Root(BoxLayout):
             r["selected"] = (i == self.sel)
         if markers is not None:
             self._markers = markers
-        self.layer.set_data(self.routes, getattr(self, "_markers", []))
+        
+        # Include user location and path if tracking
+        user_location = None
+        user_path = []
+        if self.tracking_active and self.tracker.path:
+            user_location = self.tracker.path[-1] if self.tracker.path else None
+            user_path = self.tracker.path[-50:]  # Last 50 points for breadcrumb trail
+        
+        self.layer.set_data(self.routes, getattr(self, "_markers", []), user_location, user_path)
         if fit and (self.routes or getattr(self, "_markers", [])):
             self.fit()
 

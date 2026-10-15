@@ -1,6 +1,6 @@
 [app]
 title = Tarang Nav
-package.name = tarangnav
+package.name = tarangnav3
 package.domain = org.example
 source.dir = .
 source.include_exts = py,png,jpg,kv
