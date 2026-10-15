@@ -1,12 +1,15 @@
 [app]
-title = Shortest Path Finder
-package.name = shortestpath
+title = Tarang Nav
+package.name = tarangnav
 package.domain = org.example
 source.dir = .
 source.include_exts = py,png,jpg,kv
-version = 1.0
+version = 2.0
 requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.0,kivy_garden.mapview,requests,urllib3,idna,charset-normalizer,certifi
-orientation = portrait
+orientation = all
+icon.filename = %(source.dir)s/icon.png
+presplash.filename = %(source.dir)s/presplash.png
+presplash.color = #0A1F44
 fullscreen = 0
 android.permissions = INTERNET
 android.api = 33
