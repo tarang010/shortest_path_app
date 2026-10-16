@@ -1,4 +1,11 @@
-"""Phone GPS via plyer (Android). On a desktop there is no GPS, so fixes can be injected for testing."""
+"""Phone GPS for Android.
+
+Primary path talks to Android's LocationManager directly through pyjnius, because
+plyer's gps facade frequently turns the system GPS on (requestLocationUpdates
+succeeds) yet never delivers onLocationChanged callbacks, so a fix never arrives.
+plyer is kept only as a fallback. On a desktop there is no GPS, so fixes can be
+injected for testing.
+"""
 import time
 
 from kivy.clock import Clock
@@ -14,6 +21,9 @@ class GPSProvider:
     def __init__(self, on_fix, on_status):
         self.on_fix, self.on_status = on_fix, on_status
         self.running = False
+        self._manager = None
+        self._listener = None            # strong ref so pyjnius proxy isn't GC'd
+        self._native = False
 
     def start(self):
         if self.running:
@@ -31,6 +41,96 @@ class GPSProvider:
             self.on_status("Location permission denied. Enable it in Android settings.")
 
     def _begin(self):
+        if self._begin_native():
+            return
+        self._begin_plyer()
+
+    # ------------------------------------------------------------------ native LocationManager
+    def _begin_native(self):
+        try:
+            from jnius import autoclass, PythonJavaClass, java_method
+            from android.runnable import run_on_ui_thread  # type: ignore
+
+            Context = autoclass("android.content.Context")
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            manager = activity.getSystemService(Context.LOCATION_SERVICE)
+            if manager is None:
+                return False
+
+            provider = self
+            lat_lon_ready = {"ok": False}
+
+            class _Listener(PythonJavaClass):
+                __javainterfaces__ = ["android/location/LocationListener"]
+
+                @java_method("(Landroid/location/Location;)V")
+                def onLocationChanged(self, location):
+                    provider._on_native_location(location)
+
+                @java_method("(Ljava/lang/String;)V")
+                def onProviderEnabled(self, provider_name):
+                    pass
+
+                @java_method("(Ljava/lang/String;)V")
+                def onProviderDisabled(self, provider_name):
+                    pass
+
+                @java_method("(Ljava/lang/String;ILandroid/os/Bundle;)V")
+                def onStatusChanged(self, provider_name, status, extras):
+                    pass
+
+            listener = _Listener()
+            self._manager, self._listener, self._native = manager, listener, True
+
+            LocationManager = autoclass("android.location.LocationManager")
+            providers = [LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER]
+
+            # Seed an immediate fix from the last known location if one exists.
+            for name in providers:
+                try:
+                    last = manager.getLastKnownLocation(name)
+                    if last is not None:
+                        self._on_native_location(last)
+                        lat_lon_ready["ok"] = True
+                        break
+                except Exception:
+                    pass
+
+            @run_on_ui_thread
+            def _request():
+                started = False
+                for name in providers:
+                    try:
+                        if manager.isProviderEnabled(name):
+                            manager.requestLocationUpdates(name, 1000, 0.0, listener)
+                            started = True
+                    except Exception:
+                        pass
+                if started:
+                    self.running = True
+                    if not lat_lon_ready["ok"]:
+                        self.on_status("GPS searching for a fix...")
+                else:
+                    self.on_status("Location is off. Turn on Location in Android settings.")
+
+            _request()
+            return True
+        except Exception:
+            return False
+
+    def _on_native_location(self, location):
+        try:
+            lat = location.getLatitude()
+            lon = location.getLongitude()
+            acc = location.getAccuracy() if location.hasAccuracy() else None
+            spd = location.getSpeed() if location.hasSpeed() else None
+        except Exception:
+            return
+        fix = {"lat": lat, "lon": lon, "acc": acc, "speed": spd, "t": time.time()}
+        Clock.schedule_once(lambda dt: self.on_fix(fix))
+
+    # ------------------------------------------------------------------ plyer fallback
+    def _begin_plyer(self):
         try:
             from plyer import gps
             gps.configure(on_location=self._loc, on_status=self._status)
@@ -52,13 +152,28 @@ class GPSProvider:
         Clock.schedule_once(lambda dt: self.on_status(f"GPS {stype}: {status}"))
 
     def stop(self):
-        if self.running:
+        if not self.running:
+            return
+        if self._native:
+            try:
+                from android.runnable import run_on_ui_thread  # type: ignore
+
+                @run_on_ui_thread
+                def _remove():
+                    try:
+                        self._manager.removeUpdates(self._listener)
+                    except Exception:
+                        pass
+                _remove()
+            except Exception:
+                pass
+        else:
             try:
                 from plyer import gps
                 gps.stop()
             except Exception:
                 pass
-            self.running = False
+        self.running = False
 
     def inject(self, lat, lon, acc=5.0, t=None):         # desktop testing / simulation
         self.on_fix({"lat": lat, "lon": lon, "acc": acc, "speed": None, "t": t or time.time()})
