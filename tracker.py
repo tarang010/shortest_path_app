@@ -44,17 +44,16 @@ class Tracker:
     def add_fix(self, lat, lon, t, acc=None):
         if acc is not None and acc > self.MAX_ACC:
             return False
-        if self.t0 is None:
-            self.t0 = t
-        self.t_last = t
         if self.last is None:
+            self.t0 = self.t_last = t
             self.last = (lat, lon, t)
             self.path.append((lat, lon))
             return True
         d = haversine(self.last[:2], (lat, lon))
         dt = t - self.last[2]
         if dt <= 0 or d / dt > self.MAX_SPEED:
-            return False
+            return False            # rejected fixes must not advance the clock
+        self.t_last = t
         if d < max(self.MIN_STEP, (acc or 0) * 0.5):
             return True
         self.dist += d
