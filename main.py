@@ -21,6 +21,7 @@ from kivy.properties import BooleanProperty, ListProperty, NumericProperty, Obje
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
+from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
@@ -46,6 +47,13 @@ ALT_COLOR = (0.45, 0.55, 0.72, 0.85)
 TRAIL_COLOR = (0.10, 0.75, 0.35, 1)
 MAX_STOPS = 8
 DAILY_TRAFFIC_BUDGET = 2400          # TomTom free tier is 2,500 non-tile requests/day
+
+# Built-in live-traffic key. Paste your free TomTom key here once (developer.tomtom.com).
+# Users turn it on with the "Smart traffic" toggle in Settings; no key entry needed in the app.
+TOMTOM_KEY = ""
+
+# Human-powered modes that open the Strava-style activity page when a trip starts.
+FITNESS_MODES = {"Walk", "Bicycle"}
 
 KV = """
 #:set NAVY (0.039, 0.122, 0.267, 1)
@@ -307,6 +315,28 @@ KV = """
         font_size: '10sp'
         color: MUTED
 
+<ActStat>:
+    orientation: 'vertical'
+    size_hint_y: None
+    height: dp(66)
+    padding: dp(4)
+    canvas.before:
+        Color:
+            rgba: PANEL
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(12)]
+    Label:
+        text: root.value
+        bold: True
+        font_size: '20sp'
+        color: 1, 1, 1, 1
+    Label:
+        text: root.caption
+        font_size: '11sp'
+        color: MUTED
+
 <Results>:
     orientation: 'vertical'
     padding: dp(10), dp(4), dp(10), dp(6)
@@ -444,6 +474,11 @@ class Header(BoxLayout):
 
 
 class Stat(BoxLayout):
+    value = StringProperty("")
+    caption = StringProperty("")
+
+
+class ActStat(BoxLayout):
     value = StringProperty("")
     caption = StringProperty("")
 
@@ -743,6 +778,14 @@ def fmt_clock(s):
     return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
 
 
+def fmt_pace(kmh):
+    """Walking/running pace as mm:ss per km."""
+    if kmh < 0.5:
+        return "-"
+    sec = 3600.0 / kmh
+    return f"{int(sec // 60)}:{int(sec % 60):02d} /km"
+
+
 def traffic_text(r):
     t = r.get("traffic")
     if not t or t["level"] is None:
@@ -806,7 +849,9 @@ class Ctx:
 
     @property
     def key(self):
-        return (self.s.get("tomtom_key", "") or "").strip()
+        if not self.s.get("smart_traffic", False):       # toggle is off
+            return ""
+        return TOMTOM_KEY.strip()                         # built-in key
 
     @property
     def radius_km(self):
@@ -833,7 +878,9 @@ def live_traffic(routes, mode, ctx, push, markers, notes):
     if spec["kind"] != "road" or spec["profile"] != "car":
         return ""
     if not ctx.key:
-        return "Tip: add a free TomTom key in Settings to use live traffic."
+        if ctx.s.get("smart_traffic", False):
+            return "Smart traffic is on but no traffic key is built into the app."
+        return "Tip: turn on Smart traffic in Settings for live traffic."
     push(f"Checking live traffic within {ctx.radius_km:.0f} km...", routes, markers, notes)
     try:
         used = traffic.apply_traffic(routes, ctx.ref, ctx.key, ctx.radius_km * 1000, ctx.budget())
@@ -954,7 +1001,7 @@ class Root(BoxLayout):
         self.manual_sel, self.collapsed, self._orient = False, False, None
         self._markers, self._notes, self._fitkey = [], "", None
         self.me, self.pending_from = None, None
-        self.tracking, self.tracker = False, None
+        self.tracking, self.tracker, self.act = False, None, None
         self.gps = GPSProvider(self.on_fix, self.on_gps_status)
         Clock.schedule_once(lambda dt: self.map.add_layer(self.layer), 0)
         self.form.bind(height=lambda *a: self._fit_form())
@@ -1025,7 +1072,7 @@ class Root(BoxLayout):
             pf, self.pending_from = self.pending_from, None
             self.use_my_location(pf)
         if self.tracking:
-            self.tracker.add_fix(fix["lat"], fix["lon"], fix["t"], fix.get("acc"))
+            self.tracker.add_fix(fix["lat"], fix["lon"], fix["t"], fix.get("acc"), fix.get("alt"))
             self.layer.trail = self.tracker.path
             self._update_stats(fix)
         self.layer.reposition()
@@ -1048,15 +1095,25 @@ class Root(BoxLayout):
             self.results.ids.status.text = "No GPS fix yet. Go outside or wait a few seconds, then try again."
             self.gps.start()
             return
+        mode = self.form.ids.mode.text
+        self._trip_mode = mode
+        try:
+            self._weight = float(self.settings.get("weight_kg", 70) or 70)
+        except (TypeError, ValueError):
+            self._weight = 70.0
         self.tracker = trk.Tracker()
-        self.tracker.add_fix(self.me["lat"], self.me["lon"], time.time(), self.me.get("acc"))
+        self.tracker.add_fix(self.me["lat"], self.me["lon"], time.time(), self.me.get("acc"), self.me.get("alt"))
         self.tracking = True
         self.layer.trail = self.tracker.path
         self.results.ids.tripbtn.text, self.results.ids.tripbtn.bg = "Stop trip", (0.78, 0.22, 0.27, 1)
         self._tick_ev = Clock.schedule_interval(lambda dt: self._update_stats(None), 1.0)
         self._traffic_ev = Clock.schedule_interval(lambda dt: self.refresh_traffic(), 600)
         keep_screen_on(True)
-        self.results.ids.status.text = "Trip started. Keep the app open while travelling."
+        if mode in FITNESS_MODES:
+            self.open_activity(mode)
+            self.results.ids.status.text = f"{mode} started. Keep the app open while you move."
+        else:
+            self.results.ids.status.text = "Trip started. Keep the app open while travelling."
 
     def stop_trip(self):
         self.tracking = False
@@ -1064,15 +1121,20 @@ class Root(BoxLayout):
             if ev:
                 ev.cancel()
         keep_screen_on(False)
-        mode = self.form.ids.mode.text
-        s = self.tracker.summary(mode)
+        mode = getattr(self, "_trip_mode", None) or self.form.ids.mode.text
+        weight = getattr(self, "_weight", 70.0)
+        s = self.tracker.summary(mode, weight_kg=weight)
         if s["distance_m"] > 20:
             trips = self.settings.get("trips", [])
             trips.append(s)
             self.settings.put("trips", trips[-50:])
+            saved = f"Trip saved: {fmt_km(s['distance_m'])} in {fmt_clock(s['duration_s'])} (avg {s['avg_kmh']:.0f} km/h)."
+        else:
+            saved = "Trip too short to save (under 20 m moved)."
         self.results.ids.tripbtn.text, self.results.ids.tripbtn.bg = "Start trip", FIELD
-        self.results.ids.status.text = (f"Trip saved: {fmt_km(s['distance_m'])} in {fmt_clock(s['duration_s'])} "
-                                        f"(avg {s['avg_kmh']:.0f} km/h).")
+        self.results.ids.status.text = saved
+        if getattr(self, "act", None):
+            self._finish_activity(s)
 
     def _update_stats(self, fix):
         tr, now = self.tracker, time.time()
@@ -1080,6 +1142,8 @@ class Root(BoxLayout):
         ids.s_dist.value = fmt_km(tr.dist)
         ids.s_time.value = fmt_clock(tr.elapsed(now))
         ids.s_avg.value = f"{tr.avg_kmh(now):.0f} km/h"
+        if getattr(self, "act", None):
+            self._update_activity(now)
         me = fix or self.me
         if me and 0 <= self.sel < len(self.routes) and "pcum" in self.routes[self.sel]:
             r = self.routes[self.sel]
@@ -1090,6 +1154,72 @@ class Root(BoxLayout):
             eta = left_m / v if v else (r["dur"] or 0) * (1 - frac)
             ids.status.text = (f"{frac*100:.0f}% done  |  {fmt_km(left_m)} to go  |  ETA {fmt_time(eta)}"
                                + ("  |  [color=fbbf24]off route[/color]" if off > 600 else ""))
+
+    # ---- Strava-style activity page (walk / bicycle)
+    def open_activity(self, mode):
+        self.act = {}
+        box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
+        self.act["title"] = Label(text=f"[b]{mode}[/b]  -  recording...", markup=True, font_size="17sp",
+                                  color=(1, 1, 1, 1), size_hint_y=None, height=dp(28))
+        box.add_widget(self.act["title"])
+        big = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(92))
+        self.act["dist"] = Label(text="0 m", markup=True, font_size="44sp", bold=True, color=ACCENT,
+                                 size_hint_y=None, height=dp(66))
+        big.add_widget(self.act["dist"])
+        big.add_widget(Label(text="distance covered", font_size="12sp", color=(0.66, 0.77, 0.93, 1),
+                             size_hint_y=None, height=dp(18)))
+        box.add_widget(big)
+        grid = GridLayout(cols=2, spacing=dp(8), size_hint_y=None)
+        grid.bind(minimum_height=grid.setter("height"))
+        for key_, cap in (("time", "time"), ("cal", "calories"),
+                          ("pace", "avg pace"), ("avg", "avg speed"),
+                          ("spd", "current speed"), ("alt", "altitude"),
+                          ("gain", "elevation gain"), ("loss", "elevation loss")):
+            st = ActStat(value="-", caption=cap)
+            self.act[key_] = st
+            grid.add_widget(st)
+        sv = ScrollView(bar_color=ACCENT, bar_width=dp(3), do_scroll_x=False)
+        sv.add_widget(grid)
+        box.add_widget(sv)
+        self.act["btn"] = NavButton(text="Stop & save", bg=(0.78, 0.22, 0.27, 1),
+                                    size_hint_y=None, height=dp(50))
+        self.act["btn"].bind(on_release=lambda *_: self._activity_button())
+        box.add_widget(self.act["btn"])
+        self.act["pop"] = self._popup(mode, box, dp(580))
+        self.act["pop"].bind(on_dismiss=lambda *_: setattr(self, "act", None))
+        self._update_activity(time.time())
+
+    def _update_activity(self, now):
+        tr, a = self.tracker, self.act
+        mode = getattr(self, "_trip_mode", "Walk")
+        weight = getattr(self, "_weight", 70.0)
+        a["dist"].text = fmt_km(tr.dist)
+        a["time"].value = fmt_clock(tr.elapsed(now))
+        a["cal"].value = f"{tr.calories(weight, mode):.0f} kcal"
+        a["pace"].value = fmt_pace(tr.avg_kmh(now))
+        a["avg"].value = f"{tr.avg_kmh(now):.1f} km/h"
+        a["spd"].value = f"{tr.speed * 3.6:.1f} km/h"
+        a["alt"].value = f"{tr.alt_cur:.0f} m" if tr.alt_cur is not None else "-"
+        a["gain"].value = f"{tr.gain:.0f} m"
+        a["loss"].value = f"{tr.loss:.0f} m"
+
+    def _finish_activity(self, s):
+        a = self.act
+        a["title"].text = f"[b]{s.get('mode', '')}[/b]  -  complete"
+        a["dist"].text = fmt_km(s["distance_m"])
+        a["time"].value = fmt_clock(s["duration_s"])
+        a["cal"].value = f"{s['calories']:.0f} kcal"
+        a["pace"].value = fmt_pace(s["avg_kmh"])
+        a["avg"].value = f"{s['avg_kmh']:.1f} km/h"
+        a["gain"].value = f"{s['gain_m']:.0f} m"
+        a["loss"].value = f"{s['loss_m']:.0f} m"
+        a["btn"].text, a["btn"].bg = "Close", FIELD
+
+    def _activity_button(self):
+        if self.tracking:
+            self.stop_trip()                 # stop_trip calls _finish_activity, leaving the panel open
+        elif getattr(self, "act", None):
+            self.act["pop"].dismiss()
 
     def refresh_traffic(self):
         ctx = Ctx(self.settings, (self.me["lat"], self.me["lon"]) if self.me else None)
@@ -1114,13 +1244,32 @@ class Root(BoxLayout):
         box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(4), size_hint_y=None)
         box.bind(minimum_height=box.setter("height"))
         box.add_widget(Factory.NoteLabel(text=(
-            "[b]Live traffic[/b] needs a free TomTom key (no card): sign up at developer.tomtom.com, "
-            "create a key and paste it here. Free tier: 2,500 requests/day. Each search uses about 8-24.")))
-        key = Factory.NavInput(text=self.settings.get("tomtom_key", ""), hint_text="TomTom API key")
-        rad = Factory.NavInput(text=str(self.settings.get("radius_km", 50)), hint_text="Traffic radius in km (default 50)",
-                               input_filter="float")
-        box.add_widget(key)
+            "[b]Smart traffic[/b] adds live road traffic to car routes using the app's built-in "
+            "TomTom key. Turn it on to see delays and closures. Free tier: 2,500 requests/day; "
+            "each search uses about 8-24.")))
+
+        state = {"on": bool(self.settings.get("smart_traffic", False))}
+        toggle = NavButton(bg=ACCENT if state["on"] else FIELD, size_hint_y=None, height=dp(46),
+                           text="Smart traffic:  ON" if state["on"] else "Smart traffic:  OFF")
+
+        def flip(*_):
+            state["on"] = not state["on"]
+            toggle.text = "Smart traffic:  ON" if state["on"] else "Smart traffic:  OFF"
+            toggle.bg = ACCENT if state["on"] else FIELD
+        toggle.bind(on_release=flip)
+        box.add_widget(toggle)
+        if not TOMTOM_KEY.strip():
+            box.add_widget(Factory.NoteLabel(text=(
+                "[color=ffb454]Note: no traffic key is built into this app yet. Paste one into "
+                "TOMTOM_KEY in main.py to enable live traffic.[/color]")))
+
+        rad = Factory.NavInput(text=str(self.settings.get("radius_km", 50)),
+                               hint_text="Traffic radius in km (default 50)", input_filter="float")
         box.add_widget(rad)
+        wt = Factory.NavInput(text=str(self.settings.get("weight_kg", 70)),
+                              hint_text="Body weight in kg (for calorie estimate)", input_filter="float")
+        box.add_widget(wt)
+
         q = self.settings.get("quota", {})
         used = q.get("used", 0) if q.get("date") == time.strftime("%Y-%m-%d") else 0
         box.add_widget(Factory.NoteLabel(text=f"Traffic requests used today: {used} / 2,500"))
@@ -1129,13 +1278,17 @@ class Root(BoxLayout):
         row.add_widget(cancel)
         row.add_widget(save)
         box.add_widget(row)
-        pop = self._popup("Settings", box, dp(300))
+        pop = self._popup("Settings", box, dp(340))
         box.bind(height=lambda w, h: setattr(pop, "height", h + dp(92)))
 
         def do_save(*_):
-            self.settings.put("tomtom_key", key.text.strip())
+            self.settings.put("smart_traffic", state["on"])
             try:
                 self.settings.put("radius_km", float(rad.text or 50))
+            except ValueError:
+                pass
+            try:
+                self.settings.put("weight_kg", float(wt.text or 70))
             except ValueError:
                 pass
             pop.dismiss()
@@ -1151,9 +1304,14 @@ class Root(BoxLayout):
             col.add_widget(Factory.NoteLabel(text="No trips yet. Tap Start trip while travelling."))
         for t in trips:
             when = time.strftime("%d %b %Y, %H:%M", time.localtime(t["when"])) if t.get("when") else ""
+            extra = ""
+            if t.get("calories"):
+                extra += f"   {t['calories']:.0f} kcal"
+            if t.get("gain_m"):
+                extra += f"   +{t['gain_m']:.0f}/-{t.get('loss_m', 0):.0f} m"
             col.add_widget(Factory.NoteLabel(text=(
                 f"[b][color=ffffff]{fmt_km(t['distance_m'])}[/color][/b] in {fmt_clock(t['duration_s'])}   "
-                f"avg {t['avg_kmh']:.0f} km/h   {t.get('mode','')}\n{when}"), height=dp(46)))
+                f"avg {t['avg_kmh']:.0f} km/h   {t.get('mode','')}{extra}\n{when}"), height=dp(60)))
         sv = ScrollView()
         sv.add_widget(col)
         self._popup("Past trips", sv, dp(420))

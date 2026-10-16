@@ -124,9 +124,10 @@ class GPSProvider:
             lon = location.getLongitude()
             acc = location.getAccuracy() if location.hasAccuracy() else None
             spd = location.getSpeed() if location.hasSpeed() else None
+            alt = location.getAltitude() if location.hasAltitude() else None
         except Exception:
             return
-        fix = {"lat": lat, "lon": lon, "acc": acc, "speed": spd, "t": time.time()}
+        fix = {"lat": lat, "lon": lon, "acc": acc, "speed": spd, "alt": alt, "t": time.time()}
         Clock.schedule_once(lambda dt: self.on_fix(fix))
 
     # ------------------------------------------------------------------ plyer fallback
@@ -144,7 +145,7 @@ class GPSProvider:
 
     def _loc(self, **kw):                                # called from a non-UI thread
         fix = {"lat": kw.get("lat"), "lon": kw.get("lon"), "acc": kw.get("accuracy"),
-               "speed": kw.get("speed"), "t": time.time()}
+               "speed": kw.get("speed"), "alt": kw.get("altitude"), "t": time.time()}
         if fix["lat"] is not None:
             Clock.schedule_once(lambda dt: self.on_fix(fix))
 
@@ -175,8 +176,8 @@ class GPSProvider:
                 pass
         self.running = False
 
-    def inject(self, lat, lon, acc=5.0, t=None):         # desktop testing / simulation
-        self.on_fix({"lat": lat, "lon": lon, "acc": acc, "speed": None, "t": t or time.time()})
+    def inject(self, lat, lon, acc=5.0, t=None, alt=None):   # desktop testing / simulation
+        self.on_fix({"lat": lat, "lon": lon, "acc": acc, "speed": None, "alt": alt, "t": t or time.time()})
 
 
 def keep_screen_on(on=True):
