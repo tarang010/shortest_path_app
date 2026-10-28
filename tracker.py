@@ -88,6 +88,10 @@ class Tracker:
         self._alt_s = None        # smoothed altitude
         self._alt_ref = None      # last altitude we counted a gain/loss from
 
+    def feed_altitude(self, alt):
+        """Feed an altitude reading from a dedicated sensor (barometer) outside GPS fixes."""
+        self._update_alt(alt)
+
     def _update_alt(self, alt):
         if alt is None:
             return

@@ -7,14 +7,11 @@ pre-simplified into several zoom levels so long inter-state routes stay smooth a
 import math
 import requests
 from algos import haversine
+import config
 
-UA = {"User-Agent": "TarangNav/2.0 (educational app)"}
-NOMINATIM = "https://nominatim.openstreetmap.org/search"
-SERVICES = {
-    "car":  ["https://routing.openstreetmap.de/routed-car", "https://router.project-osrm.org"],
-    "bike": ["https://routing.openstreetmap.de/routed-bike"],
-    "foot": ["https://routing.openstreetmap.de/routed-foot"],
-}
+UA = {"User-Agent": config.USER_AGENT}
+NOMINATIM = config.NOMINATIM_API
+SERVICES = config.OSRM_SERVICES
 SESSION = requests.Session()
 SESSION.headers.update(UA)
 _geo_cache = {}
@@ -150,7 +147,7 @@ def great_circle(a, b, n=64):
 
 
 def estimate_route(points, spec):
-    """Train / airplane estimate through `points` in order (dashed arcs)."""
+    """Airplane estimate through `points` in order (dashed arcs)."""
     coords, dist = [], 0.0
     for i in range(len(points) - 1):
         leg = great_circle(points[i], points[i + 1])
@@ -159,3 +156,39 @@ def estimate_route(points, spec):
     dist *= spec["circuity"]
     dur = dist / (spec["speed_kmh"] / 3.6) + spec["overhead_s"]
     return finish({"dist": dist, "dur": dur, "coords": coords, "road": True, "est": True})
+
+
+def plane_route(a, b, spec):
+    """Airplane trip from `a` to `b` as three legs:
+        road a -> nearest airport, great-circle flight, road arrival airport -> b.
+
+    Falls back to a plain great-circle estimate if airports can't be found or the
+    two points share the same nearest airport.
+    """
+    import poi
+    air_a = poi.nearest_airport(a[0], a[1])
+    air_b = poi.nearest_airport(b[0], b[1])
+    if not air_a or not air_b:
+        return estimate_route([a, b], spec)
+    pa = (air_a["lat"], air_a["lon"])
+    pb = (air_b["lat"], air_b["lon"])
+    if haversine(pa, pb) < 30_000:                         # same/adjacent airport: flying is pointless
+        return estimate_route([a, b], spec)
+
+    road1 = route_options([a, pa], "car")[0]
+    road2 = route_options([pb, b], "car")[0]
+    flight = great_circle(pa, pb)
+
+    coords = list(road1["coords"]) + flight + list(road2["coords"])
+    flight_dist = haversine(pa, pb) * spec["circuity"]
+    flight_dur = flight_dist / (spec["speed_kmh"] / 3.6) + spec["overhead_s"]
+    dist = road1["dist"] + flight_dist + road2["dist"]
+    dur = (road1["dur"] or 0) + flight_dur + (road2["dur"] or 0)
+
+    route = finish({"dist": dist, "dur": dur, "coords": coords, "road": True, "est": True})
+    route["airports"] = [(pa[0], pa[1], air_a.get("name") or "Airport"),
+                         (pb[0], pb[1], air_b.get("name") or "Airport")]
+    route["legs"] = {"to_airport_m": road1["dist"], "flight_m": flight_dist,
+                     "from_airport_m": road2["dist"],
+                     "dep": air_a.get("name"), "arr": air_b.get("name")}
+    return route

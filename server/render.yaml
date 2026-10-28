@@ -1,0 +1,21 @@
+# Render blueprint for the Tarang Nav backend.
+# In Render: New + -> Blueprint -> point at this repo. Set the secret env vars
+# (MONGODB_URI, JWT_SECRET) in the dashboard; they are marked sync:false so they
+# are never stored in git.
+services:
+  - type: web
+    name: tarang-nav-api
+    runtime: python
+    rootDir: server
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT
+    envVars:
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: MONGODB_DB_NAME
+        value: tarang
+      - key: JWT_TTL_DAYS
+        value: "30"

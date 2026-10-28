@@ -30,12 +30,29 @@ from kivy.uix.widget import Widget
 from kivy_garden.mapview import MapLayer, MapView
 
 import algos
+import api
+import background
+import config
+import fuel
 import geo
 import places
+import poi
 import traffic
 import tracker as trk
 from gps import GPSProvider, keep_screen_on
 from modes import MODES, MODE_NAMES
+from sensors import Barometer
+
+# Road modes that consume fuel (used for the fuel estimate on route cards).
+FUEL_MODES = {"Car", "Bike (motorcycle)", "Bus"}
+# Map colours for nearby points of interest.
+POI_COLOR = {"hospital": (0.85, 0.15, 0.15), "fuel": (0.96, 0.55, 0.10), "charging": (0.10, 0.70, 0.35)}
+REROUTE_OFF_M = 90        # how far off the route before we consider rerouting
+REROUTE_HOLD_S = 18       # must stay off-route this long first
+REROUTE_COOLDOWN_S = 60   # minimum gap between automatic reroutes
+# Distinct colours for other members' live dots on a combined trip.
+MEMBER_COLORS = [(0.95, 0.35, 0.55), (0.35, 0.75, 0.95), (0.95, 0.75, 0.25),
+                 (0.55, 0.85, 0.45), (0.75, 0.55, 0.95), (0.95, 0.55, 0.35)]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NAVY = (0.039, 0.122, 0.267, 1)
@@ -46,11 +63,11 @@ SEL_COLOR = (0.10, 0.45, 1.0, 1)
 ALT_COLOR = (0.45, 0.55, 0.72, 0.85)
 TRAIL_COLOR = (0.10, 0.75, 0.35, 1)
 MAX_STOPS = 8
-DAILY_TRAFFIC_BUDGET = 2400          # TomTom free tier is 2,500 non-tile requests/day
+DAILY_TRAFFIC_BUDGET = config.DAILY_TRAFFIC_BUDGET   # TomTom free tier is 2,500 non-tile requests/day
 
-# Built-in live-traffic key. Paste your free TomTom key here once (developer.tomtom.com).
+# Built-in live-traffic key, now kept in config.py (see that file for all endpoints/keys).
 # Users turn it on with the "Smart traffic" toggle in Settings; no key entry needed in the app.
-TOMTOM_KEY = ""
+TOMTOM_KEY = config.TOMTOM_KEY
 
 # Human-powered modes that open the Strava-style activity page when a trip starts.
 FITNESS_MODES = {"Walk", "Bicycle"}
@@ -186,21 +203,13 @@ KV = """
             valign: 'top'
             text_size: self.size
     NavButton:
-        text: 'Trips'
+        text: 'Menu'
         font_size: '12sp'
         bg: FIELD
         size_hint: None, None
-        size: dp(56), dp(34)
+        size: dp(64), dp(34)
         pos_hint: {'center_y': 0.5}
-        on_release: app.root.open_trips()
-    NavButton:
-        text: 'Settings'
-        font_size: '12sp'
-        bg: FIELD
-        size_hint: None, None
-        size: dp(72), dp(34)
-        pos_hint: {'center_y': 0.5}
-        on_release: app.root.open_settings()
+        on_release: app.root.open_menu()
 
 <SuggestItem>:
     background_normal: ''
@@ -396,6 +405,11 @@ KV = """
             text: 'Shortest'
             bg: PANEL
             on_release: app.root.select_kind('short')
+        NavButton:
+            id: bnear
+            text: 'Nearby'
+            bg: PANEL
+            on_release: app.root.toggle_pois()
     ScrollView:
         bar_color: ACCENT
         bar_width: dp(3)
@@ -657,6 +671,8 @@ class RouteLayer(MapLayer):
     def __init__(self, **kw):
         super().__init__(**kw)
         self.routes, self.markers, self.trail, self.me = [], [], [], None
+        self.pois = []
+        self.members = []          # other people's live locations on a combined trip
 
     def set_data(self, routes, markers):
         self.routes, self.markers = routes, markers
@@ -743,6 +759,32 @@ class RouteLayer(MapLayer):
                 tex = cl.texture
                 Color(1, 1, 1, 1)
                 Rectangle(texture=tex, pos=(x - tex.width / 2, y - tex.height / 2), size=tex.size)
+            prad = dp(7)                                   # nearby points of interest (smaller dots)
+            for p in self.pois:
+                x, y = mv.get_window_xy_from(p["lat"], p["lon"], z)
+                rgb = POI_COLOR.get(p["kind"], (0.5, 0.5, 0.5))
+                Color(1, 1, 1, 1)
+                Ellipse(pos=(x - prad - 1, y - prad - 1), size=(2 * prad + 2, 2 * prad + 2))
+                Color(*rgb, 1)
+                Ellipse(pos=(x - prad, y - prad), size=(2 * prad, 2 * prad))
+                cl = CoreLabel(text=p["label"], font_size=dp(9), bold=True)
+                cl.refresh()
+                tex = cl.texture
+                Color(1, 1, 1, 1)
+                Rectangle(texture=tex, pos=(x - tex.width / 2, y - tex.height / 2), size=tex.size)
+            mrad = dp(10)                                 # other members on a combined trip
+            for i, mem in enumerate(self.members):
+                x, y = mv.get_window_xy_from(mem["lat"], mem["lon"], z)
+                rgb = MEMBER_COLORS[i % len(MEMBER_COLORS)]
+                Color(1, 1, 1, 1)
+                Ellipse(pos=(x - mrad - 1.5, y - mrad - 1.5), size=(2 * mrad + 3, 2 * mrad + 3))
+                Color(*rgb, 1)
+                Ellipse(pos=(x - mrad, y - mrad), size=(2 * mrad, 2 * mrad))
+                cl = CoreLabel(text=mem.get("label", "?"), font_size=dp(11), bold=True)
+                cl.refresh()
+                tex = cl.texture
+                Color(1, 1, 1, 1)
+                Rectangle(texture=tex, pos=(x - tex.width / 2, y - tex.height / 2), size=tex.size)
             if self.me:                                   # blue GPS dot with accuracy halo
                 x, y = mv.get_window_xy_from(self.me["lat"], self.me["lon"], z)
                 mpp = 156543.03392 * math.cos(math.radians(self.me["lat"])) / (2 ** z)
@@ -814,6 +856,8 @@ def get_routes(mode, pts, alternatives=False, timeout=30):
             if o["dur"] is not None:
                 o["dur"] *= spec["dur_factor"]
         return opts
+    if spec["kind"] == "air" and len(pts) == 2:
+        return [geo.plane_route(pts[0], pts[1], spec)]     # road -> flight -> road
     return [geo.estimate_route(pts, spec)]
 
 
@@ -938,6 +982,15 @@ def solve(plan, mode, ctx, push):
                 routes = [dict(o, label=f"Route {i+1}", order=[0, 1]) for i, o in enumerate(opts)]
         if routes and not routes[0]["road"]:
             notes += "\n[color=ffb454]Road service unavailable - showing straight-line distance.[/color]"
+        if spec["kind"] == "air" and routes and routes[0].get("airports"):
+            for la, lo, _nm in routes[0]["airports"]:
+                markers.append((la, lo, "P", (0.55, 0.35, 0.85)))
+            lg = routes[0].get("legs") or {}
+            if lg:
+                notes += (f"\n\nFlight plan: road to {lg.get('dep') or 'departure airport'} "
+                          f"({fmt_km(lg['to_airport_m'])}) -> flight ({fmt_km(lg['flight_m'])}) -> road "
+                          f"from {lg.get('arr') or 'arrival airport'} to your destination "
+                          f"({fmt_km(lg['from_airport_m'])}).")
         notes += f"\n\nDijkstra (shortest-path tree) A->B: 0 -> 1 = {fmt_km(min(r['dist'] for r in routes))}"
         finish(routes, notes)
         return
@@ -1002,7 +1055,16 @@ class Root(BoxLayout):
         self._markers, self._notes, self._fitkey = [], "", None
         self.me, self.pending_from = None, None
         self.tracking, self.tracker, self.act = False, None, None
+        self.follow = False
+        self._off_since, self._last_reroute = None, 0.0
+        self._route_plan, self._route_mode = None, None
+        self._pois_on = False
+        self.account = self.settings.get("account")       # {'token','user_id','name'} or None
+        if self.account and self.account.get("token"):
+            api.set_token(self.account["token"])
+        self.share_trip_id, self._share_ev = None, None
         self.gps = GPSProvider(self.on_fix, self.on_gps_status)
+        self.baro = Barometer(self.on_baro_alt)
         Clock.schedule_once(lambda dt: self.map.add_layer(self.layer), 0)
         self.form.bind(height=lambda *a: self._fit_form())
         self.bind(size=lambda *a: (self.relayout(), self._fit_form()))
@@ -1072,10 +1134,33 @@ class Root(BoxLayout):
             pf, self.pending_from = self.pending_from, None
             self.use_my_location(pf)
         if self.tracking:
-            self.tracker.add_fix(fix["lat"], fix["lon"], fix["t"], fix.get("acc"), fix.get("alt"))
+            # When a barometer is active it drives elevation, so ignore noisy GPS altitude.
+            alt = None if self.baro.available else fix.get("alt")
+            self.tracker.add_fix(fix["lat"], fix["lon"], fix["t"], fix.get("acc"), alt)
             self.layer.trail = self.tracker.path
             self._update_stats(fix)
+            if self.follow:
+                self._follow_map()
         self.layer.reposition()
+
+    def on_baro_alt(self, alt, t):
+        """Barometer reading: accurate relative altitude for floor-level elevation changes."""
+        if self.tracking and self.tracker:
+            self.tracker.feed_altitude(alt)
+
+    def _follow_map(self):
+        """Keep the user roughly centred while navigating, without fighting manual panning."""
+        if not self.me:
+            return
+        try:
+            la0, lo0, la1, lo1 = self.map.get_bbox()
+        except Exception:
+            self.map.center_on(self.me["lat"], self.me["lon"])
+            return
+        mlat, mlon = self.me["lat"], self.me["lon"]
+        mla, mlo = (la1 - la0) * 0.25, (lo1 - lo0) * 0.25     # recenter only near the edges
+        if not (la0 + mla <= mlat <= la1 - mla and lo0 + mlo <= mlon <= lo1 - mlo):
+            self.map.center_on(mlat, mlon)
 
     def use_my_location(self, pf):
         if self.me:
@@ -1102,12 +1187,24 @@ class Root(BoxLayout):
         except (TypeError, ValueError):
             self._weight = 70.0
         self.tracker = trk.Tracker()
-        self.tracker.add_fix(self.me["lat"], self.me["lon"], time.time(), self.me.get("acc"), self.me.get("alt"))
+        self.baro.start()                                 # barometer for accurate floor-level elevation
+        if self.baro.available:
+            self.tracker.ELE_EMA = 0.5                    # barometer is clean, so smooth less...
+            self.tracker.ELE_THRESH = 1.0                 # ...and count changes as small as ~1 m
+        alt0 = None if self.baro.available else self.me.get("alt")
+        self.tracker.add_fix(self.me["lat"], self.me["lon"], time.time(), self.me.get("acc"), alt0)
         self.tracking = True
+        self.follow = True
+        self._off_since, self._last_reroute = None, time.time()
         self.layer.trail = self.tracker.path
+        # Background foreground-service: keeps recording when minimized / screen off.
+        self._bg = background.start(mode, self._weight)
+        self._bg_state = None
         self.results.ids.tripbtn.text, self.results.ids.tripbtn.bg = "Stop trip", (0.78, 0.22, 0.27, 1)
         self._tick_ev = Clock.schedule_interval(lambda dt: self._update_stats(None), 1.0)
         self._traffic_ev = Clock.schedule_interval(lambda dt: self.refresh_traffic(), 600)
+        if self._bg:
+            self._bg_ev = Clock.schedule_interval(lambda dt: self._read_bg(), 2.0)
         keep_screen_on(True)
         if mode in FITNESS_MODES:
             self.open_activity(mode)
@@ -1117,13 +1214,24 @@ class Root(BoxLayout):
 
     def stop_trip(self):
         self.tracking = False
-        for ev in (getattr(self, "_tick_ev", None), getattr(self, "_traffic_ev", None)):
+        self.follow = False
+        self.baro.stop()
+        bg_state = background.read_state() if getattr(self, "_bg", False) else None
+        background.stop()
+        for ev in (getattr(self, "_tick_ev", None), getattr(self, "_traffic_ev", None),
+                   getattr(self, "_bg_ev", None)):
             if ev:
                 ev.cancel()
         keep_screen_on(False)
         mode = getattr(self, "_trip_mode", None) or self.form.ids.mode.text
         weight = getattr(self, "_weight", 70.0)
         s = self.tracker.summary(mode, weight_kg=weight)
+        # The service tracked the whole time (including while minimized); if it recorded
+        # more than the paused UI did, use its numbers for the saved trip.
+        if bg_state and bg_state.get("distance_m", 0) > s["distance_m"]:
+            for k in ("distance_m", "duration_s", "moving_s", "avg_kmh", "gain_m", "loss_m", "calories"):
+                if k in bg_state:
+                    s[k] = bg_state[k]
         if s["distance_m"] > 20:
             trips = self.settings.get("trips", [])
             trips.append(s)
@@ -1136,12 +1244,34 @@ class Root(BoxLayout):
         if getattr(self, "act", None):
             self._finish_activity(s)
 
+    def _read_bg(self):
+        self._bg_state = background.read_state()
+
+    def _metrics(self, now):
+        """Live trip numbers, preferring the background service (it keeps running while
+        the app is paused) and falling back to the in-process tracker."""
+        tr = self.tracker
+        mode = getattr(self, "_trip_mode", "Walk")
+        weight = getattr(self, "_weight", 70.0)
+        st = self._bg_state if (getattr(self, "_bg", False) and self._bg_state
+                                and self._bg_state.get("running")) else None
+        if st:
+            return {"dist": st.get("distance_m", tr.dist), "elapsed": st.get("duration_s", tr.elapsed(now)),
+                    "avg": st.get("avg_kmh", tr.avg_kmh(now)), "gain": st.get("gain_m", tr.gain),
+                    "loss": st.get("loss_m", tr.loss),
+                    "cal": st.get("calories", tr.calories(weight, mode)),
+                    "speed": tr.speed * 3.6, "alt": tr.alt_cur}
+        return {"dist": tr.dist, "elapsed": tr.elapsed(now), "avg": tr.avg_kmh(now),
+                "gain": tr.gain, "loss": tr.loss, "cal": tr.calories(weight, mode),
+                "speed": tr.speed * 3.6, "alt": tr.alt_cur}
+
     def _update_stats(self, fix):
         tr, now = self.tracker, time.time()
         ids = self.results.ids
-        ids.s_dist.value = fmt_km(tr.dist)
-        ids.s_time.value = fmt_clock(tr.elapsed(now))
-        ids.s_avg.value = f"{tr.avg_kmh(now):.0f} km/h"
+        m = self._metrics(now)
+        ids.s_dist.value = fmt_km(m["dist"])
+        ids.s_time.value = fmt_clock(m["elapsed"])
+        ids.s_avg.value = f"{m['avg']:.0f} km/h"
         if getattr(self, "act", None):
             self._update_activity(now)
         me = fix or self.me
@@ -1153,7 +1283,85 @@ class Root(BoxLayout):
             v = tr.avg_kmh(now) / 3.6 if (tr.elapsed(now) > 180 and tr.dist > 500) else None
             eta = left_m / v if v else (r["dur"] or 0) * (1 - frac)
             ids.status.text = (f"{frac*100:.0f}% done  |  {fmt_km(left_m)} to go  |  ETA {fmt_time(eta)}"
-                               + ("  |  [color=fbbf24]off route[/color]" if off > 600 else ""))
+                               + ("  |  [color=fbbf24]off route[/color]" if off > REROUTE_OFF_M else ""))
+            self._maybe_reroute(off, now)
+
+    def _maybe_reroute(self, off, now):
+        """Recompute the route from the current position after the user drifts off it."""
+        mode = self._route_mode
+        if not mode or MODES.get(mode, {}).get("kind") != "road":
+            return
+        if off is None or off <= REROUTE_OFF_M:
+            self._off_since = None
+            return
+        if self._off_since is None:
+            self._off_since = now
+            return
+        if now - self._off_since >= REROUTE_HOLD_S and now - self._last_reroute >= REROUTE_COOLDOWN_S:
+            self.reroute()
+
+    def reroute(self):
+        if self.busy or not self.me or not self._route_plan or not self._route_mode:
+            return
+        dest = self._route_plan[-1]
+        cur = {"text": "My location", "lat": self.me["lat"], "lon": self.me["lon"]}
+        plan, mode = [cur, dest], self._route_mode
+        ctx = Ctx(self.settings, (self.me["lat"], self.me["lon"]))
+        self.busy, self.manual_sel = True, False
+        self._last_reroute, self._off_since = time.time(), None
+        self.loader.start()
+        self.results.ids.status.text = "Off route - recalculating from your position..."
+
+        def push(status, routes, markers, notes):
+            Clock.schedule_once(lambda dt: self.show(status, routes, markers, notes))
+
+        def work():
+            try:
+                solve(plan, mode, ctx, push)
+            except Exception as e:
+                push(f"Reroute failed: {e}", [], [], "")
+            finally:
+                Clock.schedule_once(lambda dt: self._done())
+        threading.Thread(target=work, daemon=True).start()
+
+    def toggle_pois(self):
+        """Show / hide nearby hospitals, petrol pumps and EV charging stations for the selected route."""
+        if self._pois_on or self.layer.pois:
+            self.layer.pois = []
+            self._pois_on = False
+            self.layer.reposition()
+            self.results.ids.bnear.bg = PANEL
+            self.results.ids.status.text = "Nearby places hidden."
+            return
+        if not (0 <= self.sel < len(self.routes)):
+            self.results.ids.status.text = "Find a route first, then tap Nearby."
+            return
+        r = self.routes[self.sel]
+        coords = r.get("pcoords") or r.get("coords") or []
+        self.results.ids.bnear.bg = ACCENT
+        self.results.ids.status.text = "Looking for hospitals, fuel and EV charging along the route..."
+
+        def work():
+            try:
+                found = poi.along_route(coords)
+            except Exception:
+                found = []
+            Clock.schedule_once(lambda dt: self._show_pois(found))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_pois(self, found):
+        self.layer.pois = found
+        self._pois_on = True
+        self.layer.reposition()
+        if found:
+            n = {"hospital": 0, "fuel": 0, "charging": 0}
+            for p in found:
+                n[p["kind"]] = n.get(p["kind"], 0) + 1
+            self.results.ids.status.text = (f"Nearby: {n['hospital']} hospitals (H), {n['fuel']} petrol "
+                                            f"pumps (F), {n['charging']} EV stations (E).")
+        else:
+            self.results.ids.bnear.bg = PANEL
+            self.results.ids.status.text = "No nearby places found (or the lookup service was busy)."
 
     # ---- Strava-style activity page (walk / bicycle)
     def open_activity(self, mode):
@@ -1190,18 +1398,17 @@ class Root(BoxLayout):
         self._update_activity(time.time())
 
     def _update_activity(self, now):
-        tr, a = self.tracker, self.act
-        mode = getattr(self, "_trip_mode", "Walk")
-        weight = getattr(self, "_weight", 70.0)
-        a["dist"].text = fmt_km(tr.dist)
-        a["time"].value = fmt_clock(tr.elapsed(now))
-        a["cal"].value = f"{tr.calories(weight, mode):.0f} kcal"
-        a["pace"].value = fmt_pace(tr.avg_kmh(now))
-        a["avg"].value = f"{tr.avg_kmh(now):.1f} km/h"
-        a["spd"].value = f"{tr.speed * 3.6:.1f} km/h"
-        a["alt"].value = f"{tr.alt_cur:.0f} m" if tr.alt_cur is not None else "-"
-        a["gain"].value = f"{tr.gain:.0f} m"
-        a["loss"].value = f"{tr.loss:.0f} m"
+        a = self.act
+        m = self._metrics(now)
+        a["dist"].text = fmt_km(m["dist"])
+        a["time"].value = fmt_clock(m["elapsed"])
+        a["cal"].value = f"{m['cal']:.0f} kcal"
+        a["pace"].value = fmt_pace(m["avg"])
+        a["avg"].value = f"{m['avg']:.1f} km/h"
+        a["spd"].value = f"{m['speed']:.1f} km/h"
+        a["alt"].value = f"{m['alt']:.0f} m" if m["alt"] is not None else "-"
+        a["gain"].value = f"{m['gain']:.0f} m"
+        a["loss"].value = f"{m['loss']:.0f} m"
 
     def _finish_activity(self, s):
         a = self.act
@@ -1269,6 +1476,13 @@ class Root(BoxLayout):
         wt = Factory.NavInput(text=str(self.settings.get("weight_kg", 70)),
                               hint_text="Body weight in kg (for calorie estimate)", input_filter="float")
         box.add_widget(wt)
+        box.add_widget(Factory.NoteLabel(text="[b]Advanced[/b] - fuel estimate for Car / Bike / Bus routes."))
+        mil = Factory.NavInput(text=str(self.settings.get("mileage_kmpl", "") or ""),
+                               hint_text="Vehicle mileage in km per litre", input_filter="float")
+        box.add_widget(mil)
+        price = Factory.NavInput(text=str(self.settings.get("fuel_price", "") or ""),
+                                 hint_text="Fuel price per litre (optional, for cost)", input_filter="float")
+        box.add_widget(price)
 
         q = self.settings.get("quota", {})
         used = q.get("used", 0) if q.get("date") == time.strftime("%Y-%m-%d") else 0
@@ -1291,7 +1505,18 @@ class Root(BoxLayout):
                 self.settings.put("weight_kg", float(wt.text or 70))
             except ValueError:
                 pass
+            try:
+                self.settings.put("mileage_kmpl", float(mil.text) if mil.text.strip() else 0)
+            except ValueError:
+                pass
+            try:
+                self.settings.put("fuel_price", float(price.text) if price.text.strip() else 0)
+            except ValueError:
+                pass
             pop.dismiss()
+            # redraw cards so the fuel estimate appears/updates immediately
+            if self.routes:
+                self._rebuild_cards(self._notes)
             self.results.ids.status.text = "Settings saved."
         save.bind(on_release=do_save)
         cancel.bind(on_release=lambda *_: pop.dismiss())
@@ -1316,6 +1541,353 @@ class Root(BoxLayout):
         sv.add_widget(col)
         self._popup("Past trips", sv, dp(420))
 
+    # ---- accounts & combined trips
+    def _toast(self, msg):
+        self.results.ids.status.text = msg
+
+    def _bg_call(self, fn, on_ok, on_err=None):
+        """Run a network call off the UI thread, then hand the result back on it."""
+        def work():
+            try:
+                res = fn()
+                Clock.schedule_once(lambda dt: on_ok(res))
+            except Exception as e:
+                msg = str(e)
+                Clock.schedule_once(lambda dt, m=msg: (on_err or self._toast)(m))
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_menu(self):
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10), size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
+        acct = (f"Account  ({self.account['name']})" if (self.account and self.account.get("name"))
+                else "Account / Sign in")
+        items = [(acct, self.open_account), ("Combined trips", self.open_groups),
+                 ("Past trips (this phone)", self.open_trips), ("Settings", self.open_settings)]
+        pop = self._popup("Menu", box, dp(320))
+        for label, fn in items:
+            b = NavButton(text=label, bg=FIELD, size_hint_y=None, height=dp(48))
+            b.bind(on_release=lambda w, f=fn: (pop.dismiss(), Clock.schedule_once(lambda dt: f(), 0.05)))
+            box.add_widget(b)
+        box.bind(height=lambda w, h: setattr(pop, "height", h + dp(80)))
+
+    def open_account(self):
+        if self.account and self.account.get("token"):
+            box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10), size_hint_y=None)
+            box.bind(minimum_height=box.setter("height"))
+            box.add_widget(Factory.NoteLabel(text=f"[b]Signed in[/b] as {self.account.get('name', '')}."))
+            lo = NavButton(text="Log out", bg=(0.78, 0.22, 0.27, 1), size_hint_y=None, height=dp(46))
+            box.add_widget(lo)
+            pop = self._popup("Account", box, dp(200))
+            lo.bind(on_release=lambda *_: (self.logout(), pop.dismiss()))
+            return
+        state = {"mode": "login"}
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(10), size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
+        info = Factory.NoteLabel(text="Sign in to use combined trips, shared location and photo memories.")
+        toggle = NavButton(text="New here? Create an account", bg=PANEL, size_hint_y=None, height=dp(40))
+        name = Factory.NavInput(hint_text="Your name")
+        ident = Factory.NavInput(hint_text="Email or phone number")
+        pw = Factory.NavInput(hint_text="Password (min 6 characters)", password=True)
+        submit = NavButton(text="Log in", size_hint_y=None, height=dp(48))
+        for w in (info, toggle, name, ident, pw, submit):
+            box.add_widget(w)
+        pop = self._popup("Account", box, dp(380))
+        box.bind(height=lambda w, h: setattr(pop, "height", h + dp(92)))
+
+        def refresh():
+            login = state["mode"] == "login"
+            submit.text = "Log in" if login else "Sign up"
+            toggle.text = "New here? Create an account" if login else "Have an account? Log in"
+            name.height = 0 if login else dp(46)
+            name.opacity = 0 if login else 1
+            name.disabled = login
+
+        def flip(*_):
+            state["mode"] = "signup" if state["mode"] == "login" else "login"
+            refresh()
+        toggle.bind(on_release=flip)
+
+        def do(*_):
+            idt, p = ident.text.strip(), pw.text
+            if not idt or not p:
+                self._toast("Enter your email/phone and password.")
+                return
+            submit.text, submit.disabled = "Please wait...", True
+
+            def call():
+                if state["mode"] == "login":
+                    return api.login(idt, p)
+                return api.signup(name.text.strip() or "User", idt, p)
+
+            def ok(res):
+                self.account = {"token": res["token"], "user_id": res["user_id"], "name": res["name"]}
+                self.settings.put("account", self.account)
+                pop.dismiss()
+                self._toast(f"Welcome, {res['name']}!")
+
+            def err(m):
+                submit.text = "Log in" if state["mode"] == "login" else "Sign up"
+                submit.disabled = False
+                self._toast(m)
+            self._bg_call(call, ok, err)
+        submit.bind(on_release=do)
+        refresh()
+
+    def logout(self):
+        api.clear_token()
+        self.account = None
+        self.settings.put("account", None)
+        self.stop_sharing()
+        self._toast("Logged out.")
+
+    def open_groups(self):
+        if not (self.account and self.account.get("token")):
+            self._toast("Sign in first to use combined trips.")
+            self.open_account()
+            return
+        outer = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        top = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        newname = Factory.NavInput(hint_text="New trip name")
+        create = NavButton(text="Create", size_hint_x=None, width=dp(92))
+        top.add_widget(newname)
+        top.add_widget(create)
+        outer.add_widget(top)
+        joinrow = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        joinid = Factory.NavInput(hint_text="Paste a Trip ID to join")
+        joinb = NavButton(text="Join", bg=FIELD, size_hint_x=None, width=dp(92))
+        joinrow.add_widget(joinid)
+        joinrow.add_widget(joinb)
+        outer.add_widget(joinrow)
+        col = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(6))
+        col.bind(minimum_height=col.setter("height"))
+        sv = ScrollView()
+        sv.add_widget(col)
+        outer.add_widget(sv)
+        pop = self._popup("Combined trips", outer, dp(540))
+
+        def load():
+            def ok(trips):
+                col.clear_widgets()
+                if not trips:
+                    col.add_widget(Factory.NoteLabel(text=(
+                        "No trips yet. Create one, then invite people by their email or phone. "
+                        "They can also join using the Trip ID.")))
+                for t in trips:
+                    self._group_row(col, t, pop)
+            self._bg_call(api.list_trips, ok)
+
+        def do_create(*_):
+            nm = newname.text.strip()
+            if not nm:
+                self._toast("Enter a trip name.")
+                return
+            self._bg_call(lambda: api.create_trip(nm), lambda r: (setattr(newname, "text", ""), load()))
+
+        def do_join(*_):
+            jid = joinid.text.strip()
+            if not jid:
+                self._toast("Paste a Trip ID.")
+                return
+            self._bg_call(lambda: api.join(jid),
+                          lambda r: (setattr(joinid, "text", ""), load(), self._toast("Joined the trip.")))
+        create.bind(on_release=do_create)
+        joinb.bind(on_release=do_join)
+        load()
+
+    def _group_row(self, col, t, parent_pop):
+        row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(6))
+        sharing = " [color=13d3ed](sharing)[/color]" if self.share_trip_id == t["id"] else ""
+        row.add_widget(Factory.NoteLabel(
+            text=f"[b]{t.get('name')}[/b]  ({t.get('status')}, {len(t.get('members', []))}){sharing}"))
+        openb = NavButton(text="Open", bg=FIELD, size_hint_x=None, width=dp(80))
+        openb.bind(on_release=lambda *_: (parent_pop.dismiss(), self._group_detail(t["id"])))
+        row.add_widget(openb)
+        col.add_widget(row)
+
+    def _group_detail(self, trip_id):
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8), size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
+        sv = ScrollView()
+        sv.add_widget(box)
+        pop = self._popup("Trip", sv, dp(560))
+
+        def reload(*_):
+            self._bg_call(lambda: api.get_trip(trip_id), render)
+
+        def render(t):
+            box.clear_widgets()
+            active = t.get("status") == "active"
+            box.add_widget(Factory.NoteLabel(text=f"[b]{t.get('name')}[/b]  -  {t.get('status')}"))
+            box.add_widget(Factory.NoteLabel(text=f"Trip ID (share so others can join):\n[color=a8c4ee]{t.get('id')}[/color]"))
+            mem_txt = "Members: " + ", ".join(m.get("name", "?") for m in t.get("members", []))
+            if t.get("invites"):
+                mem_txt += "\nPending invites: " + ", ".join(t["invites"])
+            box.add_widget(Factory.NoteLabel(text=mem_txt))
+
+            if active:
+                inv_row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+                inv = Factory.NavInput(hint_text="Invite by email or phone")
+                invb = NavButton(text="Invite", size_hint_x=None, width=dp(86))
+                inv_row.add_widget(inv)
+                inv_row.add_widget(invb)
+                box.add_widget(inv_row)
+
+                def do_invite(*_):
+                    idt = inv.text.strip()
+                    if not idt:
+                        self._toast("Enter an email or phone.")
+                        return
+                    self._bg_call(lambda: api.invite(trip_id, idt), lambda r: (setattr(inv, "text", ""), render(r)))
+                invb.bind(on_release=do_invite)
+
+                sharing_now = self.share_trip_id == trip_id
+                shareb = NavButton(text="Stop sharing my location" if sharing_now else "Share my live location",
+                                   bg=(0.78, 0.22, 0.27, 1) if sharing_now else ACCENT,
+                                   size_hint_y=None, height=dp(48))
+
+                def toggle_share(*_):
+                    if self.share_trip_id == trip_id:
+                        self.stop_sharing()
+                    else:
+                        self.start_sharing(trip_id)
+                    render(t)
+                shareb.bind(on_release=toggle_share)
+                box.add_widget(shareb)
+
+                place_row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+                place = Factory.NavInput(hint_text="Name this place (memory diary)")
+                placeb = NavButton(text="Log place", bg=FIELD, size_hint_x=None, width=dp(100))
+                place_row.add_widget(place)
+                place_row.add_widget(placeb)
+                box.add_widget(place_row)
+
+                def do_log(*_):
+                    nm = place.text.strip()
+                    if not nm:
+                        self._toast("Type a name for this place.")
+                        return
+                    if not self.me:
+                        self._toast("No GPS fix yet.")
+                        return
+                    self._bg_call(
+                        lambda: api.add_visited(trip_id, nm, self.me["lat"], self.me["lon"], time.time()),
+                        lambda r: (setattr(place, "text", ""), reload(), self._toast(f"Logged '{nm}'.")))
+                placeb.bind(on_release=do_log)
+
+                photob = NavButton(text="Add a photo memory", bg=FIELD, size_hint_y=None, height=dp(46))
+                photob.bind(on_release=lambda *_: self._pick_and_upload_photo(trip_id, reload))
+                box.add_widget(photob)
+
+            # memory diary: visited places + photos
+            if t.get("visited"):
+                box.add_widget(Factory.NoteLabel(text="[b]Places visited[/b]"))
+                for v in t["visited"]:
+                    when = (time.strftime("%d %b, %H:%M", time.localtime(v["arrived"]))
+                            if v.get("arrived") else "")
+                    box.add_widget(Factory.NoteLabel(text=f"- {v.get('name')}   [color=8fa6c9]{when}[/color]"))
+            if t.get("photos"):
+                box.add_widget(Factory.NoteLabel(text="[b]Photos[/b]"))
+                for ph in t["photos"]:
+                    prow = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+                    cap = ph.get("caption") or "photo"
+                    prow.add_widget(Factory.NoteLabel(text=f"- {cap}"))
+                    vb = NavButton(text="View", bg=FIELD, size_hint_x=None, width=dp(80))
+                    vb.bind(on_release=lambda w, pid=ph["id"], c=cap: self._view_photo(pid, c))
+                    prow.add_widget(vb)
+                    box.add_widget(prow)
+
+            # owner/member actions
+            act_row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+            if active:
+                arch = NavButton(text="Archive trip", bg=FIELD)
+                arch.bind(on_release=lambda *_: self._bg_call(
+                    lambda: api.archive(trip_id, self._last_personal_summary()),
+                    lambda r: (render(r), self._toast("Trip archived to memories."))))
+                act_row.add_widget(arch)
+            if t.get("is_owner"):
+                dele = NavButton(text="Delete", bg=(0.78, 0.22, 0.27, 1))
+                dele.bind(on_release=lambda *_: self._bg_call(
+                    lambda: api.delete_trip(trip_id),
+                    lambda r: (pop.dismiss(), self._toast("Trip deleted."))))
+                act_row.add_widget(dele)
+            if act_row.children:
+                box.add_widget(act_row)
+        reload()
+
+    def _last_personal_summary(self):
+        trips = self.settings.get("trips", [])
+        return trips[-1] if trips else None
+
+    def _pick_and_upload_photo(self, trip_id, done):
+        try:
+            from plyer import filechooser
+        except Exception:
+            self._toast("Photo picker not available on this device.")
+            return
+
+        def on_selection(selection):
+            if not selection:
+                return
+            path = selection[0]
+            self._toast("Uploading photo...")
+            self._bg_call(lambda: api.upload_photo(trip_id, path, ""),
+                          lambda r: (done(), self._toast("Photo added.")))
+        try:
+            filechooser.open_file(on_selection=on_selection,
+                                  filters=[["Images", "*.jpg", "*.jpeg", "*.png"]])
+        except Exception:
+            self._toast("Could not open the photo picker.")
+
+    def _view_photo(self, photo_id, caption):
+        app = App.get_running_app()
+        dest = os.path.join(app.user_data_dir, f"photo_{photo_id}.jpg")
+        self._toast("Loading photo...")
+
+        def ok(_):
+            from kivy.uix.image import Image as KImage
+            content = BoxLayout(orientation="vertical")
+            content.add_widget(KImage(source=dest, fit_mode="contain"))
+            self._popup(caption, content, dp(480))
+        self._bg_call(lambda: api.download_photo(photo_id, dest), ok)
+
+    def start_sharing(self, trip_id):
+        self.share_trip_id = trip_id
+        if self._share_ev:
+            self._share_ev.cancel()
+        self._share_ev = Clock.schedule_interval(lambda dt: self._share_tick(), 15)
+        self._share_tick()
+        self._toast("Sharing your location with the group.")
+
+    def stop_sharing(self):
+        self.share_trip_id = None
+        if self._share_ev:
+            self._share_ev.cancel()
+            self._share_ev = None
+        self.layer.members = []
+        self.layer.reposition()
+
+    def _share_tick(self):
+        tid, me = self.share_trip_id, self.me
+        if not tid:
+            return
+
+        def work():
+            try:
+                if me:
+                    api.update_location(tid, me["lat"], me["lon"])
+                locs = api.get_locations(tid)
+            except Exception:
+                return
+            mem = [{"lat": l["lat"], "lon": l["lon"], "name": l.get("name"),
+                    "label": (l.get("name") or "?")[:1].upper()}
+                   for l in locs if not l.get("is_me")]
+            Clock.schedule_once(lambda dt: self._set_members(mem))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_members(self, mem):
+        self.layer.members = mem
+        self.layer.reposition()
+
     # ---- searching
     def run(self):
         if self.busy:
@@ -1326,6 +1898,9 @@ class Root(BoxLayout):
             return
         plan = [{"text": pf.text, "lat": pf.lat, "lon": pf.lon} for pf in fields]
         mode = self.form.ids.mode.text
+        self._route_plan, self._route_mode = plan, mode
+        self.layer.pois, self._pois_on = [], False
+        self.results.ids.bnear.bg = PANEL
         ctx = Ctx(self.settings, (self.me["lat"], self.me["lon"]) if self.me else None)
         self.busy, self.manual_sel = True, False
         self.loader.start()
@@ -1397,6 +1972,11 @@ class Root(BoxLayout):
                 sub += "   |   estimate"
             if multi:
                 sub += "\n" + " > ".join(map(str, r["order"]))
+            mileage = self.settings.get("mileage_kmpl", 0)
+            if mileage and self.form.ids.mode.text in FUEL_MODES and not r.get("est"):
+                ft = fuel.summary_text(r["dist"], mileage, self.settings.get("fuel_price", 0))
+                if ft:
+                    sub += ("\n" if not multi else "   |   ") + "Fuel: " + ft
             c = RouteCard(title=title, sub=sub, selected=(i == self.sel))
             c.idx = i
             c.bind(on_release=lambda w: self.select(w.idx, manual=True))
@@ -1465,6 +2045,13 @@ class TarangNavApp(App):
 
     def on_pause(self):
         return True                                       # keep running (and tracking) when minimised
+
+    def on_resume(self):
+        root = self.root
+        if root and getattr(root, "tracking", False):
+            root._read_bg()                               # catch up on what the service recorded
+            root._update_stats(None)
+        return True
 
 
 if __name__ == "__main__":

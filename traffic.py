@@ -7,10 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from algos import haversine
 from tracker import nearest_index
+import config
 
-FLOW = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
+FLOW = config.TOMTOM_FLOW_API
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "TarangNav/3.0 (educational app)"})
+SESSION.headers.update({"User-Agent": config.USER_AGENT})
 _cache = {}
 TTL = 120                  # seconds a sample is reused (saves quota; alternatives share road)
 CLOSURE_PENALTY_S = 6 * 3600

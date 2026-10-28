@@ -1,10 +1,11 @@
 """Address suggestions while typing: Photon (OpenStreetMap data, built for search-as-you-type).
 Nominatim's public server forbids autocomplete, so it is only used for the final lookup fallback."""
 import requests
+import config
 
-PHOTON = "https://photon.komoot.io/api/"
+PHOTON = config.PHOTON_API
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "TarangNav/3.0 (educational app)"})
+SESSION.headers.update({"User-Agent": config.USER_AGENT})
 
 
 def suggest(q, bias=None, limit=5, timeout=6):
