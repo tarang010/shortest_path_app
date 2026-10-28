@@ -15,6 +15,7 @@ from kivy.core.text import Label as CoreLabel
 from kivy.core.window import Window
 from kivy.factory import Factory
 from kivy.graphics import Color, Ellipse, Line, Rectangle
+from kivy.graphics.texture import Texture
 from kivy.lang import Builder
 from kivy.metrics import dp
 from kivy.properties import BooleanProperty, ListProperty, NumericProperty, ObjectProperty, StringProperty
@@ -55,13 +56,42 @@ MEMBER_COLORS = [(0.95, 0.35, 0.55), (0.35, 0.75, 0.95), (0.95, 0.75, 0.25),
                  (0.55, 0.85, 0.45), (0.75, 0.55, 0.95), (0.95, 0.55, 0.35)]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-NAVY = (0.039, 0.122, 0.267, 1)
-ACCENT = (0.133, 0.827, 0.929, 1)
-FIELD = (0.094, 0.231, 0.463, 1)
-PANEL = (0.067, 0.176, 0.369, 1)
+NAVY = (0.027, 0.055, 0.137, 1)
+ACCENT = (0.157, 0.851, 0.918, 1)
+ACCENT2 = (0.486, 0.420, 0.969, 1)
+FIELD = (0.090, 0.161, 0.314, 1)
+PANEL = (0.055, 0.106, 0.227, 1)
 SEL_COLOR = (0.10, 0.45, 1.0, 1)
 ALT_COLOR = (0.45, 0.55, 0.72, 0.85)
 TRAIL_COLOR = (0.10, 0.75, 0.35, 1)
+GOOD = (0.26, 0.80, 0.50)
+
+
+def make_gradient(colors, horizontal=False, n=256):
+    """Build a smooth gradient Texture from a list of (r,g,b[,a]) stops (0..1).
+
+    Used to give panels, the header and primary buttons real depth instead of
+    flat fills. The texture is 1xN (or Nx1) and stretched by the GPU.
+    """
+    def lerp(a, b, t):
+        return a + (b - a) * t
+    stops = max(1, len(colors) - 1)
+    buf = bytearray()
+    for i in range(n):
+        seg = (i / (n - 1)) * stops
+        k = min(int(seg), stops - 1)
+        tt = seg - k
+        c0, c1 = colors[k], colors[k + 1]
+        a0 = c0[3] if len(c0) > 3 else 1.0
+        a1 = c1[3] if len(c1) > 3 else 1.0
+        buf += bytes((int(lerp(c0[0], c1[0], tt) * 255), int(lerp(c0[1], c1[1], tt) * 255),
+                      int(lerp(c0[2], c1[2], tt) * 255), int(lerp(a0, a1, tt) * 255)))
+    tex = Texture.create(size=((n, 1) if horizontal else (1, n)), colorfmt="rgba")
+    tex.blit_buffer(bytes(buf), colorfmt="rgba", bufferfmt="ubyte")
+    tex.wrap = "clamp_to_edge"
+    tex.mag_filter = "linear"
+    tex.min_filter = "linear"
+    return tex
 MAX_STOPS = 8
 DAILY_TRAFFIC_BUDGET = config.DAILY_TRAFFIC_BUDGET   # TomTom free tier is 2,500 non-tile requests/day
 
@@ -73,12 +103,15 @@ TOMTOM_KEY = config.TOMTOM_KEY
 FITNESS_MODES = {"Walk", "Bicycle"}
 
 KV = """
-#:set NAVY (0.039, 0.122, 0.267, 1)
-#:set PANEL (0.067, 0.176, 0.369, 1)
-#:set FIELD (0.094, 0.231, 0.463, 1)
-#:set ACCENT (0.133, 0.827, 0.929, 1)
-#:set DANGER (0.78, 0.22, 0.27, 1)
-#:set MUTED (0.66, 0.77, 0.93, 1)
+#:set NAVY (0.027, 0.055, 0.137, 1)
+#:set PANEL (0.055, 0.106, 0.227, 1)
+#:set FIELD (0.090, 0.161, 0.314, 1)
+#:set ACCENT (0.157, 0.851, 0.918, 1)
+#:set ACCENT2 (0.486, 0.420, 0.969, 1)
+#:set DANGER (0.886, 0.267, 0.333, 1)
+#:set MUTED (0.631, 0.733, 0.890, 1)
+#:set CARD (0.078, 0.149, 0.290, 1)
+#:set STROKE (1, 1, 1, 0.08)
 
 <NavInput@TextInput>:
     background_normal: ''
@@ -99,16 +132,34 @@ KV = """
     background_normal: ''
     background_down: ''
     background_color: 0, 0, 0, 0
-    color: (0.039, 0.122, 0.267, 1) if self.bg[1] > 0.5 else (1, 1, 1, 1)
+    color: (0.02, 0.06, 0.16, 1) if self.bg[1] > 0.5 else (1, 1, 1, 1)
     bold: True
     font_size: '15sp'
     canvas.before:
         Color:
-            rgba: self.bg if self.state == 'normal' else (self.bg[0] * 0.75, self.bg[1] * 0.75, self.bg[2] * 0.75, 1)
+            rgba: self.bg if self.state == 'normal' else (self.bg[0] * 0.78, self.bg[1] * 0.78, self.bg[2] * 0.78, 1)
         RoundedRectangle:
             pos: self.pos
             size: self.size
             radius: [dp(12)]
+    canvas.after:
+        Color:
+            rgba: STROKE
+        Line:
+            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(12))
+            width: 1
+
+<PrimaryButton@NavButton>:
+    color: 0.02, 0.06, 0.16, 1
+    font_size: '16sp'
+    canvas.before:
+        Color:
+            rgba: (1, 1, 1, 1) if self.state == 'normal' else (0.82, 0.82, 0.82, 1)
+        RoundedRectangle:
+            texture: app.tex_accent
+            pos: self.pos
+            size: self.size
+            radius: [dp(14)]
 
 <NavSpinner@Spinner>:
     background_normal: ''
@@ -171,19 +222,25 @@ KV = """
 
 <Header>:
     size_hint_y: None
-    height: dp(60)
-    padding: dp(12), dp(6)
-    spacing: dp(8)
+    height: dp(66)
+    padding: dp(14), dp(6)
+    spacing: dp(10)
     canvas.before:
         Color:
-            rgba: PANEL
+            rgba: 1, 1, 1, 1
         Rectangle:
+            texture: app.tex_header
             pos: self.pos
             size: self.size
+        Color:
+            rgba: ACCENT
+        Rectangle:
+            pos: self.x, self.y
+            size: self.width, dp(2.5)
     Image:
         source: root.logo
         size_hint: None, 1
-        width: dp(44)
+        width: dp(46)
         fit_mode: 'contain'
     BoxLayout:
         orientation: 'vertical'
@@ -274,8 +331,9 @@ KV = """
     spacing: dp(6)
     canvas.before:
         Color:
-            rgba: NAVY
+            rgba: 1, 1, 1, 1
         Rectangle:
+            texture: app.tex_panel
             pos: self.pos
             size: self.size
     PlaceField:
@@ -306,14 +364,22 @@ KV = """
             text: 'Car'
             values: root.mode_names
             size_hint_x: 0.58
-    NavButton:
+    PrimaryButton:
         text: 'Find routes'
         size_hint_y: None
-        height: dp(48)
+        height: dp(50)
         on_release: root.go()
 
 <Stat>:
     orientation: 'vertical'
+    padding: dp(2), dp(5)
+    canvas.before:
+        Color:
+            rgba: 0, 0, 0, 0.16
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(10)]
     Label:
         text: root.value
         bold: True
@@ -352,8 +418,9 @@ KV = """
     spacing: dp(6)
     canvas.before:
         Color:
-            rgba: NAVY
+            rgba: 1, 1, 1, 1
         Rectangle:
+            texture: app.tex_panel
             pos: self.pos
             size: self.size
     Label:
@@ -424,26 +491,39 @@ KV = """
 <RouteCard>:
     orientation: 'vertical'
     size_hint_y: None
-    height: dp(70)
-    padding: dp(14), dp(6)
+    height: dp(82)
+    padding: dp(20), dp(9), dp(14), dp(9)
     canvas.before:
         Color:
-            rgba: ACCENT if self.selected else FIELD
+            rgba: 0, 0, 0, 0.22
         RoundedRectangle:
+            pos: self.x + dp(1.5), self.y - dp(2.5)
+            size: self.width, self.height
+            radius: [dp(16)]
+        Color:
+            rgba: 1, 1, 1, 1
+        RoundedRectangle:
+            texture: app.tex_card_sel if self.selected else app.tex_card
             pos: self.pos
             size: self.size
-            radius: [dp(12)]
+            radius: [dp(16)]
         Color:
-            rgba: (0.08, 0.22, 0.46, 1) if self.selected else PANEL
+            rgba: root.accent
         RoundedRectangle:
-            pos: self.x + dp(2), self.y + dp(2)
-            size: self.width - dp(4), self.height - dp(4)
-            radius: [dp(10)]
+            pos: self.x + dp(6), self.y + dp(8)
+            size: dp(5), self.height - dp(16)
+            radius: [dp(3)]
+    canvas.after:
+        Color:
+            rgba: ACCENT if self.selected else STROKE
+        Line:
+            rounded_rectangle: (self.x, self.y, self.width, self.height, dp(16))
+            width: 1.4 if self.selected else 1
     Label:
         text: root.title
         markup: True
         bold: True
-        font_size: '15sp'
+        font_size: '15.5sp'
         color: 1, 1, 1, 1
         halign: 'left'
         valign: 'bottom'
@@ -505,6 +585,7 @@ class RouteCard(ButtonBehavior, BoxLayout):
     selected = BooleanProperty(False)
     title = StringProperty("")
     sub = StringProperty("")
+    accent = ListProperty([0.55, 0.62, 0.78, 1])
 
 
 class Results(BoxLayout):
@@ -709,6 +790,12 @@ class RouteLayer(MapLayer):
         if mv is None:
             return
         self.canvas.clear()
+        try:
+            self._draw(mv)                                # a bad geometry must never crash the app
+        except Exception:
+            pass
+
+    def _draw(self, mv):
         z = mv.zoom
         try:
             bb = tuple(mv.get_bbox())
@@ -857,7 +944,10 @@ def get_routes(mode, pts, alternatives=False, timeout=30):
                 o["dur"] *= spec["dur_factor"]
         return opts
     if spec["kind"] == "air" and len(pts) == 2:
-        return [geo.plane_route(pts[0], pts[1], spec)]     # road -> flight -> road
+        try:
+            return [geo.plane_route(pts[0], pts[1], spec)]  # road -> flight -> road
+        except Exception:
+            return [geo.estimate_route(pts, spec)]          # network/airport failure: plain arc
     return [geo.estimate_route(pts, spec)]
 
 
@@ -982,15 +1072,18 @@ def solve(plan, mode, ctx, push):
                 routes = [dict(o, label=f"Route {i+1}", order=[0, 1]) for i, o in enumerate(opts)]
         if routes and not routes[0]["road"]:
             notes += "\n[color=ffb454]Road service unavailable - showing straight-line distance.[/color]"
-        if spec["kind"] == "air" and routes and routes[0].get("airports"):
-            for la, lo, _nm in routes[0]["airports"]:
-                markers.append((la, lo, "P", (0.55, 0.35, 0.85)))
-            lg = routes[0].get("legs") or {}
-            if lg:
-                notes += (f"\n\nFlight plan: road to {lg.get('dep') or 'departure airport'} "
-                          f"({fmt_km(lg['to_airport_m'])}) -> flight ({fmt_km(lg['flight_m'])}) -> road "
-                          f"from {lg.get('arr') or 'arrival airport'} to your destination "
-                          f"({fmt_km(lg['from_airport_m'])}).")
+        try:
+            if spec["kind"] == "air" and routes and routes[0].get("airports"):
+                for la, lo, _nm in routes[0]["airports"]:
+                    markers.append((la, lo, "P", (0.55, 0.35, 0.85)))
+                lg = routes[0].get("legs") or {}
+                if lg:
+                    notes += (f"\n\nFlight plan: road to {lg.get('dep') or 'departure airport'} "
+                              f"({fmt_km(lg['to_airport_m'])}) -> flight ({fmt_km(lg['flight_m'])}) -> road "
+                              f"from {lg.get('arr') or 'arrival airport'} to your destination "
+                              f"({fmt_km(lg['from_airport_m'])}).")
+        except Exception:
+            pass
         notes += f"\n\nDijkstra (shortest-path tree) A->B: 0 -> 1 = {fmt_km(min(r['dist'] for r in routes))}"
         finish(routes, notes)
         return
@@ -1069,7 +1162,10 @@ class Root(BoxLayout):
         self.form.bind(height=lambda *a: self._fit_form())
         self.bind(size=lambda *a: (self.relayout(), self._fit_form()))
         self.relayout()
+        self._gps_tries = 0
         Clock.schedule_once(lambda dt: self.gps.start(), 1.0)
+        # Cold GPS starts are slow and sometimes need a nudge; retry until we get a fix.
+        Clock.schedule_interval(lambda dt: self._gps_watchdog(), 12)
 
     # ---- layout
     def relayout(self):
@@ -1161,6 +1257,24 @@ class Root(BoxLayout):
         mla, mlo = (la1 - la0) * 0.25, (lo1 - lo0) * 0.25     # recenter only near the edges
         if not (la0 + mla <= mlat <= la1 - mla and lo0 + mlo <= mlon <= lo1 - mlo):
             self.map.center_on(mlat, mlon)
+
+    def _gps_watchdog(self):
+        if self.me is not None:
+            return False                                  # got a fix -> cancel the watchdog
+        self._gps_tries += 1
+        if self._gps_tries > 6:
+            if not self.busy and not self.tracking:
+                self.results.ids.status.text = ("Still no GPS. Turn on Location (High accuracy) in "
+                                                 "Android settings, then tap the GPS button.")
+            return False
+        try:
+            self.gps.start()
+        except Exception:
+            pass
+        if not self.busy and not self.tracking:
+            self.results.ids.status.text = ("Searching for GPS... make sure Location is ON and you are "
+                                             "near a window or outside.")
+        return True
 
     def use_my_location(self, pf):
         if self.me:
@@ -1907,7 +2021,8 @@ class Root(BoxLayout):
         stops = len(plan) - 2
         short = lambda t: t.split(",")[0].strip()[:24]
         self.summary.text = (f"{short(plan[0]['text'])}  >  {short(plan[-1]['text'])}"
-                             + (f"  +{stops} stop{'s' if stops != 1 else ''}" if stops else "") + f"   |   {mode}   (tap to edit)")
+                             + (f"  +{stops} stop{'s' if stops != 1 else ''}" if stops else "")
+                             + f"   |   {mode}   (tap to edit)")
         self.set_collapsed(True)
         for pf in self.form.fields():
             pf.ids.ti.focus = False
@@ -1977,7 +2092,13 @@ class Root(BoxLayout):
                 ft = fuel.summary_text(r["dist"], mileage, self.settings.get("fuel_price", 0))
                 if ft:
                     sub += ("\n" if not multi else "   |   ") + "Fuel: " + ft
-            c = RouteCard(title=title, sub=sub, selected=(i == self.sel))
+            if i == self.fast_i:
+                acc = [GOOD[0], GOOD[1], GOOD[2], 1]
+            elif i == self.short_i:
+                acc = [ACCENT[0], ACCENT[1], ACCENT[2], 1]
+            else:
+                acc = [0.55, 0.62, 0.78, 1]
+            c = RouteCard(title=title, sub=sub, selected=(i == self.sel), accent=acc)
             c.idx = i
             c.bind(on_release=lambda w: self.select(w.idx, manual=True))
             c.opacity = 0
@@ -2036,10 +2157,21 @@ class Root(BoxLayout):
 class TarangNavApp(App):
     title = "Tarang Nav"
     icon = os.path.join(HERE, "icon.png")
+    tex_panel = ObjectProperty(None)
+    tex_header = ObjectProperty(None)
+    tex_accent = ObjectProperty(None)
+    tex_card = ObjectProperty(None)
+    tex_card_sel = ObjectProperty(None)
 
     def build(self):
         Window.clearcolor = NAVY
         Window.softinput_mode = "below_target"
+        # Gradient textures give the UI depth; must exist before the KV rules run.
+        self.tex_panel = make_gradient([(0.047, 0.094, 0.196, 1), (0.020, 0.043, 0.110, 1)])
+        self.tex_header = make_gradient([(0.102, 0.192, 0.396, 1), (0.047, 0.094, 0.216, 1)], horizontal=True)
+        self.tex_accent = make_gradient([(0.188, 0.918, 0.953, 1), (0.235, 0.510, 0.961, 1)], horizontal=True)
+        self.tex_card = make_gradient([(0.086, 0.165, 0.318, 1), (0.051, 0.102, 0.223, 1)])
+        self.tex_card_sel = make_gradient([(0.125, 0.333, 0.576, 1), (0.070, 0.180, 0.404, 1)])
         Builder.load_string(KV)
         return Root()
 
@@ -2048,9 +2180,15 @@ class TarangNavApp(App):
 
     def on_resume(self):
         root = self.root
-        if root and getattr(root, "tracking", False):
-            root._read_bg()                               # catch up on what the service recorded
-            root._update_stats(None)
+        if root:
+            if getattr(root, "tracking", False):
+                root._read_bg()                           # catch up on what the service recorded
+                root._update_stats(None)
+            if root.me is None:                           # nudge GPS again after returning
+                try:
+                    root.gps.start()
+                except Exception:
+                    pass
         return True
 
 
