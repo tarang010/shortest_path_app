@@ -103,16 +103,6 @@ TOMTOM_KEY = config.TOMTOM_KEY
 FITNESS_MODES = {"Walk", "Bicycle"}
 
 KV = """
-#:set NAVY (0.027, 0.055, 0.137, 1)
-#:set PANEL (0.055, 0.106, 0.227, 1)
-#:set FIELD (0.090, 0.161, 0.314, 1)
-#:set ACCENT (0.157, 0.851, 0.918, 1)
-#:set ACCENT2 (0.486, 0.420, 0.969, 1)
-#:set DANGER (0.886, 0.267, 0.333, 1)
-#:set MUTED (0.631, 0.733, 0.890, 1)
-#:set CARD (0.078, 0.149, 0.290, 1)
-#:set STROKE (1, 1, 1, 0.08)
-
 <NavInput@TextInput>:
     background_normal: ''
     background_active: ''
@@ -1166,6 +1156,9 @@ class Root(BoxLayout):
         Clock.schedule_once(lambda dt: self.gps.start(), 1.0)
         # Cold GPS starts are slow and sometimes need a nudge; retry until we get a fix.
         Clock.schedule_interval(lambda dt: self._gps_watchdog(), 12)
+        # Pull a fresh location every 3 s so distance keeps updating even when the OS
+        # stops pushing location callbacks on its own.
+        Clock.schedule_interval(lambda dt: self.gps.poll(), 3)
 
     # ---- layout
     def relayout(self):
@@ -1339,7 +1332,7 @@ class Root(BoxLayout):
         keep_screen_on(False)
         mode = getattr(self, "_trip_mode", None) or self.form.ids.mode.text
         weight = getattr(self, "_weight", 70.0)
-        s = self.tracker.summary(mode, weight_kg=weight)
+        s = self.tracker.summary(mode, now=time.time(), weight_kg=weight)
         # The service tracked the whole time (including while minimized); if it recorded
         # more than the paused UI did, use its numbers for the saved trip.
         if bg_state and bg_state.get("distance_m", 0) > s["distance_m"]:
@@ -1359,21 +1352,34 @@ class Root(BoxLayout):
             self._finish_activity(s)
 
     def _read_bg(self):
-        self._bg_state = background.read_state()
+        st = background.read_state()
+        self._bg_state = st
+        if not st or not st.get("running"):
+            return
+        # If the background service is ahead of the in-app tracker (e.g. it ran while
+        # the app was minimized), adopt its position and trail so the map is correct.
+        if st.get("lat") is not None and st.get("distance_m", 0) >= self.tracker.dist:
+            self.me = {"lat": st["lat"], "lon": st["lon"], "acc": st.get("acc"),
+                       "speed": None, "alt": None, "t": st.get("updated", time.time())}
+            self.layer.me = self.me
+            path = st.get("path")
+            if path and len(path) > len(self.layer.trail):
+                self.layer.trail = [tuple(p) for p in path]
+            self.layer.reposition()
 
     def _metrics(self, now):
-        """Live trip numbers, preferring the background service (it keeps running while
-        the app is paused) and falling back to the in-process tracker."""
+        """Live trip numbers. Uses whichever source has travelled further: the in-app
+        tracker (reliable while the app is open) or the background service (which keeps
+        running while the app is minimized)."""
         tr = self.tracker
         mode = getattr(self, "_trip_mode", "Walk")
         weight = getattr(self, "_weight", 70.0)
         st = self._bg_state if (getattr(self, "_bg", False) and self._bg_state
                                 and self._bg_state.get("running")) else None
-        if st:
-            return {"dist": st.get("distance_m", tr.dist), "elapsed": st.get("duration_s", tr.elapsed(now)),
-                    "avg": st.get("avg_kmh", tr.avg_kmh(now)), "gain": st.get("gain_m", tr.gain),
-                    "loss": st.get("loss_m", tr.loss),
-                    "cal": st.get("calories", tr.calories(weight, mode)),
+        if st and st.get("distance_m", 0) > tr.dist:
+            return {"dist": st.get("distance_m", 0), "elapsed": st.get("duration_s", tr.elapsed(now)),
+                    "avg": st.get("avg_kmh", 0), "gain": st.get("gain_m", tr.gain),
+                    "loss": st.get("loss_m", tr.loss), "cal": st.get("calories", 0),
                     "speed": tr.speed * 3.6, "alt": tr.alt_cur}
         return {"dist": tr.dist, "elapsed": tr.elapsed(now), "avg": tr.avg_kmh(now),
                 "gain": tr.gain, "loss": tr.loss, "cal": tr.calories(weight, mode),
@@ -1556,8 +1562,13 @@ class Root(BoxLayout):
 
     # ---- popups
     def _popup(self, title, content, height):
-        p = Popup(title=title, content=content, size_hint=(0.92, None), height=height, background="",
-                  background_color=(0.04, 0.12, 0.27, 0.98), separator_color=ACCENT, title_color=(1, 1, 1, 1))
+        # Responsive: narrower on landscape/large screens, and never taller than the window.
+        land = Window.width > Window.height
+        sx = 0.62 if land else 0.92
+        h = min(height, Window.height * 0.9)
+        p = Popup(title=title, content=content, size_hint=(sx, None), height=h, background="",
+                  background_color=(PANEL[0], PANEL[1], PANEL[2], 0.97), separator_color=ACCENT,
+                  title_color=(1, 1, 1, 1))
         p.open()
         return p
 
@@ -1938,6 +1949,15 @@ class Root(BoxLayout):
         except Exception:
             self._toast("Photo picker not available on this device.")
             return
+        # Android 13+ needs the media permission granted at runtime before the picker.
+        try:
+            from android.permissions import Permission, request_permissions
+            perms = [p for p in ("READ_MEDIA_IMAGES", "READ_EXTERNAL_STORAGE")
+                     if hasattr(Permission, p)]
+            if perms:
+                request_permissions([getattr(Permission, p) for p in perms])
+        except Exception:
+            pass
 
         def on_selection(selection):
             if not selection:
@@ -2154,6 +2174,59 @@ class Root(BoxLayout):
         Clock.schedule_once(lambda dt: self.layer.reposition(), 0.2)
 
 
+# ----------------------------------------------------------------------------- theming
+# Two glassmorphism palettes chosen by time of day. Both stay dark enough that the
+# white label text remains readable (a pure-white light theme would need every label
+# recoloured). "day" is a brighter blue glass; "night" is the deep premium dark glass.
+THEMES = {
+    "night": {
+        "navy": (0.043, 0.063, 0.125, 1), "panel": (0.071, 0.102, 0.176, 1),
+        "field": (0.110, 0.150, 0.240, 1), "accent": (0.275, 0.898, 1.0, 1),
+        "accent2": (0.486, 0.420, 0.969, 1), "danger": (0.886, 0.267, 0.333, 1),
+        "muted": (0.62, 0.70, 0.85, 1), "card": (0.078, 0.118, 0.206, 1),
+        "stroke": (1, 1, 1, 0.09),
+        "g_panel": [(0.063, 0.09, 0.17), (0.033, 0.05, 0.105)],
+        "g_header": [(0.09, 0.14, 0.26), (0.047, 0.067, 0.14)],
+        "g_accent": [(0.30, 0.92, 1.0), (0.16, 0.55, 0.95)],
+        "g_card": [(0.085, 0.125, 0.215), (0.05, 0.08, 0.155)],
+        "g_card_sel": [(0.12, 0.27, 0.45), (0.07, 0.15, 0.31)],
+    },
+    "day": {
+        "navy": (0.086, 0.145, 0.243, 1), "panel": (0.118, 0.188, 0.302, 1),
+        "field": (0.160, 0.230, 0.360, 1), "accent": (0.200, 0.800, 0.980, 1),
+        "accent2": (0.450, 0.520, 0.960, 1), "danger": (0.886, 0.300, 0.360, 1),
+        "muted": (0.75, 0.83, 0.94, 1), "card": (0.130, 0.200, 0.320, 1),
+        "stroke": (1, 1, 1, 0.14),
+        "g_panel": [(0.12, 0.19, 0.31), (0.08, 0.14, 0.24)],
+        "g_header": [(0.16, 0.26, 0.42), (0.10, 0.17, 0.29)],
+        "g_accent": [(0.26, 0.86, 1.0), (0.22, 0.55, 0.96)],
+        "g_card": [(0.14, 0.22, 0.35), (0.10, 0.16, 0.27)],
+        "g_card_sel": [(0.18, 0.34, 0.54), (0.12, 0.24, 0.42)],
+    },
+}
+
+
+def pick_theme():
+    """Daylight hours use the brighter 'day' glass; evening/night uses 'night'."""
+    h = time.localtime().tm_hour
+    return THEMES["day"] if 6 <= h < 18 else THEMES["night"]
+
+
+def _palette_kv(t):
+    def c(v):
+        return "(" + ", ".join(str(x) for x in v) + ")"
+    names = (("NAVY", "navy"), ("PANEL", "panel"), ("FIELD", "field"), ("ACCENT", "accent"),
+             ("ACCENT2", "accent2"), ("DANGER", "danger"), ("MUTED", "muted"),
+             ("CARD", "card"), ("STROKE", "stroke"))
+    return "\n".join(f"#:set {kv} {c(t[key])}" for kv, key in names) + "\n\n"
+
+
+def _apply_theme(t):
+    """Push the theme colours into the module globals used by Python-built widgets."""
+    global NAVY, ACCENT, FIELD, PANEL, ACCENT2
+    NAVY, ACCENT, FIELD, PANEL, ACCENT2 = t["navy"], t["accent"], t["field"], t["panel"], t["accent2"]
+
+
 class TarangNavApp(App):
     title = "Tarang Nav"
     icon = os.path.join(HERE, "icon.png")
@@ -2164,15 +2237,18 @@ class TarangNavApp(App):
     tex_card_sel = ObjectProperty(None)
 
     def build(self):
-        Window.clearcolor = NAVY
+        theme = pick_theme()
+        _apply_theme(theme)
+        self.theme = theme
+        Window.clearcolor = theme["navy"]
         Window.softinput_mode = "below_target"
         # Gradient textures give the UI depth; must exist before the KV rules run.
-        self.tex_panel = make_gradient([(0.047, 0.094, 0.196, 1), (0.020, 0.043, 0.110, 1)])
-        self.tex_header = make_gradient([(0.102, 0.192, 0.396, 1), (0.047, 0.094, 0.216, 1)], horizontal=True)
-        self.tex_accent = make_gradient([(0.188, 0.918, 0.953, 1), (0.235, 0.510, 0.961, 1)], horizontal=True)
-        self.tex_card = make_gradient([(0.086, 0.165, 0.318, 1), (0.051, 0.102, 0.223, 1)])
-        self.tex_card_sel = make_gradient([(0.125, 0.333, 0.576, 1), (0.070, 0.180, 0.404, 1)])
-        Builder.load_string(KV)
+        self.tex_panel = make_gradient(theme["g_panel"])
+        self.tex_header = make_gradient(theme["g_header"], horizontal=True)
+        self.tex_accent = make_gradient(theme["g_accent"], horizontal=True)
+        self.tex_card = make_gradient(theme["g_card"])
+        self.tex_card_sel = make_gradient(theme["g_card_sel"])
+        Builder.load_string(_palette_kv(theme) + KV)
         return Root()
 
     def on_pause(self):

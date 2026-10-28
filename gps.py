@@ -24,6 +24,7 @@ class GPSProvider:
         self._manager = None
         self._listener = None            # strong ref so pyjnius proxy isn't GC'd
         self._native = False
+        self._last_loc_time = 0          # ms timestamp of the newest fix we have emitted
 
     def start(self):
         if self.running:
@@ -125,10 +126,33 @@ class GPSProvider:
             acc = location.getAccuracy() if location.hasAccuracy() else None
             spd = location.getSpeed() if location.hasSpeed() else None
             alt = location.getAltitude() if location.hasAltitude() else None
+            self._last_loc_time = max(self._last_loc_time, location.getTime())
         except Exception:
             return
         fix = {"lat": lat, "lon": lon, "acc": acc, "speed": spd, "alt": alt, "t": time.time()}
         Clock.schedule_once(lambda dt: self.on_fix(fix))
+
+    def poll(self):
+        """Actively pull the newest known location. Called on a 3 s timer so a fix
+        still arrives even when the system stops firing onLocationChanged (common on
+        many phones), which otherwise leaves distance stuck at zero."""
+        if not ANDROID or self._manager is None:
+            return
+        try:
+            from jnius import autoclass
+            LocationManager = autoclass("android.location.LocationManager")
+            best = None
+            for name in (LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER):
+                try:
+                    loc = self._manager.getLastKnownLocation(name)
+                except Exception:
+                    loc = None
+                if loc is not None and (best is None or loc.getTime() > best.getTime()):
+                    best = loc
+            if best is not None and best.getTime() > self._last_loc_time:
+                self._on_native_location(best)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ plyer fallback
     def _begin_plyer(self):
