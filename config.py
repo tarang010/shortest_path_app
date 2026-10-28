@@ -57,7 +57,7 @@ USER_AGENT = "TarangNav/4.0 (educational app)"
 # Point this at your deployed backend. The app talks ONLY to this URL for
 # login/signup, combined trips and photos. Override at runtime with the
 # TARANG_BACKEND_URL environment variable if you like.
-BACKEND_URL = os.environ.get("TARANG_BACKEND_URL", "https://your-backend.onrender.com")
+BACKEND_URL = os.environ.get("TARANG_BACKEND_URL", "https://shortest-path-app.onrender.com")
 
 # ============================================================================
 # SERVER-SIDE  — NEVER ship these in the APK
